@@ -226,9 +226,11 @@ does not implement TLS. **Do not expose port 8765 to the public internet.**
 - [x] `--daemon`, `--once`, `--status`, `--config`, `--version` CLI surface
 - [x] Configuration fallback from `cwm.toml` to legacy `service.toml`
 - [ ] MCP stdio JSON-RPC surface (`wall_monitor_status`,
-      `wall_monitor_refresh_credentials`) — placeholder, lands once we
-      pick a Go MCP SDK we like.
-- [ ] GitHub Actions release pipeline (GoReleaser, linux+macOS, amd64+arm64)
+      `wall_monitor_refresh_credentials`). Implemented in Go to keep the
+      single-binary story; SDK candidates are
+      [`mark3labs/mcp-go`](https://github.com/mark3labs/mcp-go) (mature,
+      community) and [`modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk)
+      (official, newer).
 
 ## License
 
