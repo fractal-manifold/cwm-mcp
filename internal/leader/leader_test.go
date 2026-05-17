@@ -78,7 +78,7 @@ func TestRun_PromotesAfterPeerExits(t *testing.T) {
 	var promoted atomic.Bool
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, addr, logger, func(ctx context.Context, ln net.Listener) error {
+		done <- Run(ctx, addr, nil, logger, func(ctx context.Context, ln net.Listener) error {
 			promoted.Store(true)
 			ln.Close()
 			return nil
@@ -128,7 +128,7 @@ func TestRun_RespectsContextCancel(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, addr, logger, func(context.Context, net.Listener) error {
+		done <- Run(ctx, addr, nil, logger, func(context.Context, net.Listener) error {
 			return nil
 		})
 	}()

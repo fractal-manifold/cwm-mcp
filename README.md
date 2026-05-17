@@ -157,6 +157,19 @@ Then `systemctl --user enable --now cwm-mcp`. Your Claude Code sessions
 will still spawn `cwm-mcp` in stdio mode and will simply observe the
 daemon's port (follower mode, no-op).
 
+## MCP tools
+
+When launched without `--daemon`, `cwm-mcp` exposes the following tools
+to Claude Code over stdio JSON-RPC. The model invokes them when you ask
+diagnostic questions about your wall monitor.
+
+| Tool                          | What it does |
+|-------------------------------|--------------|
+| `wall_monitor_status`         | Snapshot: leader/follower role, since when, last ESP32 request (time, remote, HTTP status), request count. |
+| `wall_monitor_health`         | End-to-end check: credentials file readable + unexpired, broker reachable via a self-signed self-ping, observed traffic in the last window. Returns PASS/FAIL per component. |
+| `wall_monitor_recent_logs`    | Tail of the in-memory broker log (default 50 lines, max 500). Shows auth rejections, peer IPs, role transitions. |
+| `wall_monitor_provision_hint` | The laptop's LAN IPv4 addresses + the configured port, formatted as `http://…` URLs to paste into the device's captive portal. |
+
 ## Modes & flags
 
 | Flag         | Behaviour                                                              |
@@ -225,12 +238,9 @@ does not implement TLS. **Do not expose port 8765 to the public internet.**
 - [x] Leader election via TCP bind, 5 s probe interval
 - [x] `--daemon`, `--once`, `--status`, `--config`, `--version` CLI surface
 - [x] Configuration fallback from `cwm.toml` to legacy `service.toml`
-- [ ] MCP stdio JSON-RPC surface (`wall_monitor_status`,
-      `wall_monitor_refresh_credentials`). Implemented in Go to keep the
-      single-binary story; SDK candidates are
-      [`mark3labs/mcp-go`](https://github.com/mark3labs/mcp-go) (mature,
-      community) and [`modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk)
-      (official, newer).
+- [x] MCP stdio JSON-RPC surface via
+      [`mark3labs/mcp-go`](https://github.com/mark3labs/mcp-go), with
+      four tools (see below)
 
 ## License
 

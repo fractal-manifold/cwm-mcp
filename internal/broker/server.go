@@ -2,8 +2,10 @@
 // polls. The handler validates the request's HMAC headers, then reads the
 // Claude CLI credentials file and returns the bearer token.
 //
-// Serve(ctx, ln, cfg, logger) accepts an already-bound listener so the
-// leader-election layer can hand it the socket without races.
+// Serve(ctx, ln, cfg, st, logger) accepts an already-bound listener so
+// the leader-election layer can hand it the socket without races, and a
+// *state.State that the handler updates after each request so the MCP
+// tools can introspect activity.
 package broker
 
 import (
@@ -19,13 +21,34 @@ import (
 	"github.com/fractal-manifold/cwm-mcp/internal/auth"
 	"github.com/fractal-manifold/cwm-mcp/internal/config"
 	"github.com/fractal-manifold/cwm-mcp/internal/creds"
+	"github.com/fractal-manifold/cwm-mcp/internal/state"
 )
 
-// NewMux returns the HTTP handler used by both Serve and tests.
-func NewMux(cfg *config.Config, cache *auth.NonceCache, logger *log.Logger) *http.ServeMux {
+// statusRecorder lets us learn the response code chosen by the handler
+// so we can record it on the shared *state.State. Every code path in
+// this package calls WriteHeader explicitly, so the default of 200 is
+// only used in the unlikely "wrote a body without WriteHeader" case.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(s int) {
+	r.status = s
+	r.ResponseWriter.WriteHeader(s)
+}
+
+// NewMux returns the HTTP handler used by both Serve and tests. The
+// returned mux records every /credentials hit on `st` (remote addr +
+// response code).
+func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger *log.Logger) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/credentials", func(w http.ResponseWriter, r *http.Request) {
-		handleCredentials(cfg, cache, logger, w, r)
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		handleCredentials(cfg, cache, logger, rec, r)
+		if st != nil {
+			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
+		}
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
@@ -97,10 +120,10 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // Serve takes ownership of an already-bound listener and runs the HTTP
 // broker until ctx is cancelled. On cancellation it shuts down with a 1s
 // drain so the leader-election follower can grab the port quickly.
-func Serve(ctx context.Context, ln net.Listener, cfg *config.Config, logger *log.Logger) error {
+func Serve(ctx context.Context, ln net.Listener, cfg *config.Config, st *state.State, logger *log.Logger) error {
 	cache := auth.NewNonceCache(time.Duration(cfg.Security.NonceCacheTTLSeconds) * time.Second)
 	srv := &http.Server{
-		Handler:           NewMux(cfg, cache, logger),
+		Handler:           NewMux(cfg, cache, st, logger),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

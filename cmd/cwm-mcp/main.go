@@ -22,20 +22,27 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
+
+	mcpserver "github.com/mark3labs/mcp-go/server"
 
 	"github.com/fractal-manifold/cwm-mcp/internal/auth"
 	"github.com/fractal-manifold/cwm-mcp/internal/broker"
 	"github.com/fractal-manifold/cwm-mcp/internal/config"
 	"github.com/fractal-manifold/cwm-mcp/internal/creds"
 	"github.com/fractal-manifold/cwm-mcp/internal/leader"
+	"github.com/fractal-manifold/cwm-mcp/internal/logbuf"
+	"github.com/fractal-manifold/cwm-mcp/internal/mcp"
+	"github.com/fractal-manifold/cwm-mcp/internal/state"
 )
 
 // Version is overridden at build time via -ldflags "-X main.Version=...".
@@ -54,13 +61,17 @@ func main() {
 		return
 	}
 
-	logger := log.New(os.Stderr, "cwm-mcp ", log.LstdFlags|log.Lmicroseconds)
-
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
 		os.Exit(2)
 	}
+
+	// All log output goes to stderr (stdio MCP reserves stdout for
+	// JSON-RPC). We also tee into a small ring buffer so the
+	// wall_monitor_recent_logs tool has something to return.
+	logs := logbuf.New(200)
+	logger := log.New(io.MultiWriter(os.Stderr, logs), "cwm-mcp ", log.LstdFlags|log.Lmicroseconds)
 
 	switch {
 	case *onceMode:
@@ -68,9 +79,9 @@ func main() {
 	case *statusMode:
 		os.Exit(runStatus(cfg))
 	case *daemonMode:
-		os.Exit(runDaemon(cfg, logger))
+		os.Exit(runDaemon(cfg, logger, logs))
 	default:
-		os.Exit(runMCP(cfg, logger))
+		os.Exit(runMCP(cfg, logger, logs))
 	}
 }
 
@@ -92,39 +103,68 @@ func runOnce(cfg *config.Config) int {
 	return 0
 }
 
-func runDaemon(cfg *config.Config, logger *log.Logger) int {
+func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
 	addr := addrOf(cfg)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		logger.Printf("listen %s: %v", addr, err)
 		return 1
 	}
+	st := state.New()
+	st.SetRole(state.RoleLeader)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := broker.Serve(ctx, ln, cfg, logger); err != nil {
+	if err := broker.Serve(ctx, ln, cfg, st, logger); err != nil {
 		logger.Printf("broker: %v", err)
 		return 1
 	}
+	_ = logs // referenced for symmetry; not consumed in daemon mode
 	return 0
 }
 
-func runMCP(cfg *config.Config, logger *log.Logger) int {
-	addr := addrOf(cfg)
+// runMCP launches the broker (under leader-election) and the MCP stdio
+// server in parallel. Either returning is treated as a normal shutdown
+// signal for the whole process — Claude Code expects an MCP server to
+// exit cleanly when its stdio peer closes.
+func runMCP(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
+	st := state.New()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	// TODO(mcp-layer): start the MCP stdio JSON-RPC server here in parallel
-	// once we pick an SDK. For now the binary already covers its main job
-	// (broker + leader-election) and Claude Code is happy to spawn it via
-	// stdio even without tools exposed.
+	var wg sync.WaitGroup
 
-	err := leader.Run(ctx, addr, logger, func(c context.Context, ln net.Listener) error {
-		return broker.Serve(c, ln, cfg, logger)
-	})
-	if err != nil && !errors.Is(err, context.Canceled) {
-		logger.Printf("leader: %v", err)
-		return 1
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		mcpSrv := mcp.NewServer(mcp.Deps{
+			Cfg:     cfg,
+			State:   st,
+			Logs:    logs,
+			Version: Version,
+		})
+		if err := mcpserver.ServeStdio(mcpSrv); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Printf("mcp stdio: %v", err)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		err := leader.Run(ctx, addrOf(cfg), st, logger, func(c context.Context, ln net.Listener) error {
+			return broker.Serve(c, ln, cfg, st, logger)
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logger.Printf("leader: %v", err)
+		}
+	}()
+
+	wg.Wait()
 	return 0
 }
 
@@ -137,7 +177,11 @@ func runMCP(cfg *config.Config, logger *log.Logger) int {
 // Output is a single-line JSON to stdout for easy scripting.
 func runStatus(cfg *config.Config) int {
 	addr := addrOf(cfg)
-	url := "http://" + addr + "/credentials"
+	host := cfg.Server.Bind
+	if host == "0.0.0.0" || host == "" {
+		host = "127.0.0.1"
+	}
+	url := "http://" + net.JoinHostPort(host, strconv.Itoa(cfg.Server.Port)) + "/credentials"
 
 	nonce := "0123456789abcdef0123456789abcdef"
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
@@ -151,7 +195,7 @@ func runStatus(cfg *config.Config) int {
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Do(req)
 
-	out := map[string]any{"addr": addr}
+	out := map[string]any{"addr": addr, "probe_url": url}
 	switch {
 	case err != nil:
 		out["broker"] = "down"

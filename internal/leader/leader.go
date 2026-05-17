@@ -19,6 +19,8 @@ import (
 	"net"
 	"syscall"
 	"time"
+
+	"github.com/fractal-manifold/cwm-mcp/internal/state"
 )
 
 // RetryInterval controls how often a follower retries the bind. 5 s was
@@ -53,7 +55,10 @@ type OnAcquired func(context.Context, net.Listener) error
 // Run keeps trying to become the leader for addr until ctx is cancelled.
 // It logs the first follower-fall and each promotion but stays quiet on
 // subsequent retries to keep the log readable.
-func Run(ctx context.Context, addr string, logger *log.Logger, onAcquired OnAcquired) error {
+//
+// `st` (may be nil) is updated on every role transition so the MCP tools
+// can report current state.
+func Run(ctx context.Context, addr string, st *state.State, logger *log.Logger, onAcquired OnAcquired) error {
 	announcedFollower := false
 	for {
 		ln, gained, err := Acquire(addr)
@@ -62,6 +67,9 @@ func Run(ctx context.Context, addr string, logger *log.Logger, onAcquired OnAcqu
 			logger.Printf("leader: listen %s: %v (will retry in %s)", addr, err, RetryInterval)
 		case gained:
 			announcedFollower = false
+			if st != nil {
+				st.SetRole(state.RoleLeader)
+			}
 			logger.Printf("leader: bound %s", addr)
 			runErr := onAcquired(ctx, ln)
 			if ctx.Err() != nil {
@@ -74,6 +82,9 @@ func Run(ctx context.Context, addr string, logger *log.Logger, onAcquired OnAcqu
 			if !announcedFollower {
 				logger.Printf("leader: %s busy, running as follower (probing every %s)", addr, RetryInterval)
 				announcedFollower = true
+			}
+			if st != nil {
+				st.SetRole(state.RoleFollower)
 			}
 		}
 
