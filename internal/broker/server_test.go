@@ -72,7 +72,7 @@ func newTestServer(t *testing.T, credsPath string) (*httptest.Server, *config.Co
 	cfg := newTestConfig(t, credsPath)
 	cache := auth.NewNonceCache(time.Duration(cfg.Security.NonceCacheTTLSeconds) * time.Second)
 	logger := log.New(io.Discard, "", 0)
-	ts := httptest.NewServer(NewMux(cfg, cache, state.New(), logger))
+	ts := httptest.NewServer(NewMux(cfg, cache, state.New(), logger, nil))
 	t.Cleanup(ts.Close)
 	return ts, cfg
 }

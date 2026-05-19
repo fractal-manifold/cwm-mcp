@@ -1,20 +1,30 @@
 // Package mcp exposes the cwm-mcp tools to Claude Code over the standard
-// MCP stdio JSON-RPC transport. Four tools are registered:
+// MCP stdio JSON-RPC transport. Five tools are registered:
 //
-//   wall_monitor_status         — quick snapshot (role, last request, etc.)
-//   wall_monitor_health         — full diagnostic: creds + self-ping
-//   wall_monitor_recent_logs    — last N broker log lines
-//   wall_monitor_provision_hint — IP/port to enter in the device's captive portal
+//   wall_monitor_status          — quick snapshot (role, last request, etc.)
+//   wall_monitor_health          — full diagnostic: creds + self-ping
+//   wall_monitor_recent_logs     — last N broker log lines (local buffer)
+//   wall_monitor_firmware_logs   — last N ESP-IDF log lines from the device
+//   wall_monitor_provision_hint  — IP/port to enter in the device's captive portal
 //
 // The MCP server runs in its own goroutine alongside the broker; it does
 // not own the listener or the broker — it just reads from the shared
 // state/logbuf and sends signed self-probes via HTTP when asked.
+//
+// wall_monitor_firmware_logs goes through the broker's /firmware-logs HTTP
+// endpoint (signed HMAC) instead of reading a local logbuf. That way any
+// session — leader or follower — can see the same tail, since only the
+// leader process owns the serial port but every process can do a signed
+// loopback GET to whatever process won leadership.
 package mcp
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -71,6 +81,16 @@ func NewServer(d Deps) *server.MCPServer {
 			),
 		),
 		handleRecentLogs(d),
+	)
+
+	s.AddTool(
+		mcp.NewTool("wall_monitor_firmware_logs",
+			mcp.WithDescription("Tail the ESP-IDF log stream from the device over USB-CDC. Requires `[serial] device` to be set in cwm.toml on the laptop running cwm-mcp. The tool fetches via a signed HTTP GET to the broker, so any cwm-mcp session (leader or follower) returns the same lines. Default is the last 200 lines; max 2000."),
+			mcp.WithString("limit",
+				mcp.Description("How many lines to return (1..2000). Defaults to 200."),
+			),
+		),
+		handleFirmwareLogs(d),
 	)
 
 	s.AddTool(
@@ -243,6 +263,70 @@ func handleRecentLogs(d Deps) server.ToolHandlerFunc {
 			Lines []string `json:"lines"`
 		}{Total: d.Logs.Len(), Lines: lines})
 	}
+}
+
+// --- wall_monitor_firmware_logs ---------------------------------------------
+
+func handleFirmwareLogs(d Deps) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		limit := 200
+		if raw := req.GetString("limit", ""); raw != "" {
+			if n, err := strconv.Atoi(raw); err == nil {
+				switch {
+				case n < 1:
+					limit = 1
+				case n > 2000:
+					limit = 2000
+				default:
+					limit = n
+				}
+			}
+		}
+
+		host := d.Cfg.Server.Bind
+		if host == "0.0.0.0" || host == "" {
+			host = "127.0.0.1"
+		}
+		url := "http://" + net.JoinHostPort(host, strconv.Itoa(d.Cfg.Server.Port)) +
+			"/firmware-logs?limit=" + strconv.Itoa(limit)
+
+		nonce := freshNonce()
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		sig := auth.ComputeSignature(d.Cfg.PSK(), "GET", "/firmware-logs", ts, nonce)
+
+		httpReq, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+		httpReq.Header.Set("X-Cwm-Timestamp", ts)
+		httpReq.Header.Set("X-Cwm-Nonce", nonce)
+		httpReq.Header.Set("X-Cwm-Signature", sig)
+
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			return mcp.NewToolResultJSON(struct {
+				OK    bool   `json:"ok"`
+				Error string `json:"error"`
+			}{OK: false, Error: "broker unreachable: " + err.Error()})
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			return mcp.NewToolResultJSON(struct {
+				OK         bool   `json:"ok"`
+				HTTPStatus int    `json:"http_status"`
+				Body       string `json:"body"`
+			}{OK: false, HTTPStatus: resp.StatusCode, Body: string(body)})
+		}
+		// Pass through the broker's JSON body unchanged.
+		return mcp.NewToolResultText(string(body)), nil
+	}
+}
+
+// freshNonce returns a 32-hex random nonce, the format the broker's
+// HMAC verifier requires (isHex32 in internal/auth).
+func freshNonce() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 // --- wall_monitor_provision_hint --------------------------------------------

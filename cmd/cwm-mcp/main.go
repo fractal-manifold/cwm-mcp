@@ -18,6 +18,8 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -42,6 +44,7 @@ import (
 	"github.com/fractal-manifold/cwm-mcp/internal/leader"
 	"github.com/fractal-manifold/cwm-mcp/internal/logbuf"
 	"github.com/fractal-manifold/cwm-mcp/internal/mcp"
+	"github.com/fractal-manifold/cwm-mcp/internal/serial"
 	"github.com/fractal-manifold/cwm-mcp/internal/state"
 )
 
@@ -53,6 +56,8 @@ func main() {
 	daemonMode := flag.Bool("daemon", false, "Standalone broker — bind unconditionally, no leader-election")
 	onceMode := flag.Bool("once", false, "Validate credentials file and exit")
 	statusMode := flag.Bool("status", false, "Probe local broker and print status JSON")
+	logsMode := flag.Bool("logs", false, "Tail firmware logs from the running broker (Ctrl-C to stop)")
+	logsTail := flag.Int("logs-tail", 50, "How many backlog lines to print before following live (with --logs)")
 	versionFlag := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -78,6 +83,8 @@ func main() {
 		os.Exit(runOnce(cfg))
 	case *statusMode:
 		os.Exit(runStatus(cfg))
+	case *logsMode:
+		os.Exit(runLogs(cfg, *logsTail))
 	case *daemonMode:
 		os.Exit(runDaemon(cfg, logger, logs))
 	default:
@@ -115,12 +122,40 @@ func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int 
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := broker.Serve(ctx, ln, cfg, st, logger); err != nil {
+
+	fwBuf, fwLogs, stopTailer := startFirmwareTailer(ctx, cfg, logger)
+	defer stopTailer()
+
+	if err := broker.Serve(ctx, ln, cfg, st, logger, fwLogs); err != nil {
 		logger.Printf("broker: %v", err)
 		return 1
 	}
-	_ = logs // referenced for symmetry; not consumed in daemon mode
+	_, _ = logs, fwBuf // retained for symmetry / future diagnostics
 	return 0
+}
+
+// startFirmwareTailer creates the firmware logbuf and (if configured)
+// launches the USB-CDC tailer in a background goroutine. The returned
+// FirmwareLogSource is what the broker mux serves on /firmware-logs.
+// stopTailer is a no-op when the tailer is disabled; otherwise it cancels
+// the goroutine's context.
+func startFirmwareTailer(ctx context.Context, cfg *config.Config, logger *log.Logger) (*logbuf.Buffer, broker.FirmwareLogSource, func()) {
+	size := cfg.Serial.Lines
+	if size <= 0 {
+		size = 2000
+	}
+	buf := logbuf.New(size)
+	if cfg.Serial.Device == "" {
+		return buf, broker.NewFirmwareLogs(buf, func() bool { return false }), func() {}
+	}
+	tailer := &serial.Tailer{
+		Device: cfg.Serial.Device,
+		Writer: buf,
+		Logger: logger,
+	}
+	tailCtx, cancel := context.WithCancel(ctx)
+	go tailer.Run(tailCtx)
+	return buf, broker.NewFirmwareLogs(buf, tailer.Connected), cancel
 }
 
 // runMCP launches the broker (under leader-election) and the MCP stdio
@@ -156,8 +191,14 @@ func runMCP(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
 	go func() {
 		defer wg.Done()
 		defer cancel()
+		// The serial tailer must run only inside the leader's lifecycle so
+		// the device port has exactly one reader. We start it here, scoped
+		// to the listener's context, so it dies cleanly when this peer
+		// loses leadership (or shuts down).
 		err := leader.Run(ctx, addrOf(cfg), st, logger, func(c context.Context, ln net.Listener) error {
-			return broker.Serve(c, ln, cfg, st, logger)
+			_, fwLogs, stopTailer := startFirmwareTailer(c, cfg, logger)
+			defer stopTailer()
+			return broker.Serve(c, ln, cfg, st, logger, fwLogs)
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			logger.Printf("leader: %v", err)
@@ -213,4 +254,144 @@ func runStatus(cfg *config.Config) int {
 	b, _ := json.Marshal(out)
 	fmt.Println(string(b))
 	return 0
+}
+
+// runLogs follows the broker's /firmware-logs endpoint. It prints `tail`
+// backlog lines, then polls every 500ms and prints whatever is new. We
+// rely on the broker's monotonic `total_available` counter to detect new
+// lines without re-printing the buffer: keep the high-water mark, ask for
+// `delta` lines, print the last `delta` of the response. If the ring
+// evicted faster than we polled, we surface a "[N lines lost]" notice so
+// the gap is obvious.
+//
+// Exit codes:
+//
+//	0 — Ctrl-C
+//	1 — broker unreachable (after a couple of retries on first hit)
+//	2 — auth / config error (PSK mismatch, etc.)
+func runLogs(cfg *config.Config, tail int) int {
+	if tail < 0 {
+		tail = 0
+	}
+	if tail > 2000 {
+		tail = 2000
+	}
+
+	host := cfg.Server.Bind
+	if host == "0.0.0.0" || host == "" {
+		host = "127.0.0.1"
+	}
+	base := "http://" + net.JoinHostPort(host, strconv.Itoa(cfg.Server.Port)) + "/firmware-logs"
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// First fetch: ask for the backlog so the user sees something
+	// immediately, even if the device hasn't said anything since they
+	// last looked.
+	resp, lostInitial, err := fetchLogs(ctx, cfg, base, tail)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cwm-mcp logs: %v\n", err)
+		return 1
+	}
+	_ = lostInitial // backlog fetch — nothing to "lose" yet.
+	if !resp.Connected && cfg.Serial.Device == "" {
+		fmt.Fprintln(os.Stderr, "cwm-mcp logs: no [serial] device configured in cwm.toml; the broker has nothing to stream.")
+		return 2
+	}
+	for _, l := range resp.Lines {
+		fmt.Println(l)
+	}
+	highWater := resp.Total
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	connected := resp.Connected
+	for {
+		select {
+		case <-ctx.Done():
+			return 0
+		case <-ticker.C:
+		}
+		// Cap requested limit so a momentary giant burst doesn't pull a
+		// 2000-line block: if delta>1000 we already missed live and just
+		// catch up with the recent tail.
+		want := 1000
+		next, lost, err := fetchLogs(ctx, cfg, base, want)
+		if err != nil {
+			// Transient: the leader may be re-electing. Note it once
+			// and keep polling.
+			fmt.Fprintf(os.Stderr, "cwm-mcp logs: %v (retrying)\n", err)
+			continue
+		}
+		if next.Connected != connected {
+			if next.Connected {
+				fmt.Fprintln(os.Stderr, "[serial: reconnected]")
+			} else {
+				fmt.Fprintln(os.Stderr, "[serial: device disconnected]")
+			}
+			connected = next.Connected
+		}
+		if next.Total <= highWater {
+			continue
+		}
+		delta := next.Total - highWater
+		if delta > len(next.Lines) {
+			fmt.Fprintf(os.Stderr, "[%d lines lost — ring evicted faster than polling]\n", delta-len(next.Lines))
+			delta = len(next.Lines)
+		}
+		for _, l := range next.Lines[len(next.Lines)-delta:] {
+			fmt.Println(l)
+		}
+		highWater = next.Total
+		_ = lost
+	}
+}
+
+type firmwareLogsBody struct {
+	Connected bool     `json:"connected"`
+	Total     int      `json:"total_available"`
+	Lines     []string `json:"lines"`
+}
+
+// fetchLogs issues one signed GET to /firmware-logs?limit=…. The second
+// return value is reserved for future "lost lines" plumbing exposed by
+// the broker (currently unused).
+func fetchLogs(ctx context.Context, cfg *config.Config, base string, limit int) (firmwareLogsBody, int, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	url := base + "?limit=" + strconv.Itoa(limit)
+	nonce := freshHexNonce()
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := auth.ComputeSignature(cfg.PSK(), "GET", "/firmware-logs", ts, nonce)
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req.Header.Set("X-Cwm-Timestamp", ts)
+	req.Header.Set("X-Cwm-Nonce", nonce)
+	req.Header.Set("X-Cwm-Signature", sig)
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return firmwareLogsBody{}, 0, fmt.Errorf("broker unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return firmwareLogsBody{}, 0, fmt.Errorf("broker http %d: %s", resp.StatusCode, string(body))
+	}
+	var out firmwareLogsBody
+	if err := json.Unmarshal(body, &out); err != nil {
+		return firmwareLogsBody{}, 0, fmt.Errorf("decode body: %w", err)
+	}
+	return out, 0, nil
+}
+
+// freshHexNonce mirrors the MCP-side helper: 32 hex chars from crypto/rand
+// so the broker's isHex32 check accepts it.
+func freshHexNonce() string {
+	var b [16]byte
+	_, _ = cryptorand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }

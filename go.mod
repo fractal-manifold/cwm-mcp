@@ -2,7 +2,10 @@ module github.com/fractal-manifold/cwm-mcp
 
 go 1.25.5
 
-require github.com/BurntSushi/toml v1.4.0
+require (
+	github.com/BurntSushi/toml v1.4.0
+	golang.org/x/sys v0.5.0
+)
 
 require (
 	github.com/google/jsonschema-go v0.4.2 // indirect

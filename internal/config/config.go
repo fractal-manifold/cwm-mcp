@@ -29,6 +29,7 @@ type Config struct {
 	Credentials Credentials `toml:"credentials"`
 	Security    Security    `toml:"security"`
 	Logging     Logging     `toml:"logging"`
+	Serial      Serial      `toml:"serial"`
 	pskBytes    []byte
 }
 
@@ -53,6 +54,16 @@ type Security struct {
 
 type Logging struct {
 	Level string `toml:"level"`
+}
+
+// Serial is the USB-CDC tail for the device's ESP-IDF logs. When Device is
+// empty the tailer is disabled — leaving idf.py monitor free to own the
+// port. When set, only the leader process opens it; followers read via
+// the broker's HTTP /firmware-logs endpoint.
+type Serial struct {
+	Device string `toml:"device"`
+	Baud   int    `toml:"baud"`
+	Lines  int    `toml:"lines"`
 }
 
 func (c *Config) PSK() []byte { return c.pskBytes }
@@ -134,6 +145,7 @@ func defaults() *Config {
 			NonceCacheTTLSeconds:    300,
 		},
 		Logging: Logging{Level: "INFO"},
+		Serial:  Serial{Device: "", Baud: 115200, Lines: 2000},
 	}
 }
 
@@ -159,4 +171,17 @@ nonce_cache_ttl_seconds = 300
 
 [logging]
 level = "INFO"
+
+[serial]
+# USB-CDC device that streams ESP-IDF logs. Leave empty (default) to keep
+# idf.py monitor as the sole owner of the port. When set, the leader
+# cwm-mcp process opens it and exposes the tail via:
+#   - MCP tool wall_monitor_firmware_logs
+#   - HTTP GET /firmware-logs (HMAC-signed)
+# device = "/dev/esp32s3"
+# baud is meaningless for true USB-CDC; the kernel ignores it. Set to
+# whatever you'd pass idf.py — it's just for documentation.
+baud = 115200
+# Ring buffer size in lines.
+lines = 2000
 `
