@@ -72,14 +72,24 @@ level = "INFO"
 `~/.config/claude-wall-monitor/service.toml` (same schema), so existing
 `service-go` users don't need to move files.
 
-## Register in Claude Code
+## Register with MCP-aware CLIs
 
-Pick one:
+`cwm-mcp` speaks stdio MCP, so any MCP-aware CLI can launch it as a
+subprocess. The leader-election in the binary means it is safe to register
+it in several CLIs at once — the first instance to bind `:8765` becomes the
+broker, the rest stay as silent followers.
 
-**Per-user** — every Claude Code session of yours launches it:
+In every command below, pass an **absolute path** (`$(command -v cwm-mcp)`)
+rather than relying on the CLI inheriting your shell `PATH` — Codex and
+Gemini both spawn the server from a non-login environment where
+`~/.local/bin` may not be on `PATH`.
+
+### Claude Code
+
+Per-user (every session of yours launches it):
 
 ```sh
-claude mcp add cwm-mcp -- cwm-mcp
+claude mcp add cwm-mcp -- "$(command -v cwm-mcp)"
 ```
 
 Or, by hand, in `~/.claude.json`:
@@ -88,26 +98,68 @@ Or, by hand, in `~/.claude.json`:
 {
   "mcpServers": {
     "cwm-mcp": {
-      "command": "cwm-mcp"
+      "command": "/absolute/path/to/cwm-mcp"
     }
   }
 }
 ```
 
-**Per-project** — only inside this repo:
+Per-project (only inside one repo):
 
 ```json
 // .mcp.json at the project root
 {
   "mcpServers": {
     "cwm-mcp": {
-      "command": "cwm-mcp"
+      "command": "/absolute/path/to/cwm-mcp"
     }
   }
 }
 ```
 
 Verify with `claude mcp list` and `/mcp` inside Claude Code.
+
+### Codex CLI
+
+```sh
+codex mcp add cwm-mcp -- "$(command -v cwm-mcp)"
+```
+
+Writes `[mcp_servers.cwm-mcp]` to `~/.codex/config.toml`. Verify with
+`codex mcp list` and `codex mcp get cwm-mcp` — transport should read
+`stdio` and the command path should be absolute.
+
+In interactive `codex`, the first tool invocation prompts you to approve
+the MCP call. In non-interactive `codex exec`, that prompt has no UI to
+answer it and the call is auto-cancelled with `user cancelled MCP tool
+call`. To use the tools from `codex exec` (CI, scripts), disable the
+review feature for that invocation:
+
+```sh
+codex exec -c features.mcp_tool_call_review=false "..."
+```
+
+Or persist it globally in `~/.codex/config.toml`:
+
+```toml
+[features]
+mcp_tool_call_review = false
+```
+
+### Gemini CLI
+
+```sh
+gemini mcp add -s user --trust cwm-mcp "$(command -v cwm-mcp)"
+```
+
+- `-s user` writes to `~/.gemini/settings.json` (global). Without it the
+  default scope is `project` and Gemini would write to
+  `<cwd>/.gemini/settings.json`, which is rarely what you want for a
+  host-level utility.
+- `--trust` suppresses the per-call confirmation prompt — the server is
+  local-only and behind HMAC auth, the prompt is just friction.
+
+Verify with `gemini mcp list`; the server should report `✓ Connected`.
 
 ## Coexistence with an existing broker
 
@@ -169,6 +221,103 @@ diagnostic questions about your wall monitor.
 | `wall_monitor_health`         | End-to-end check: credentials file readable + unexpired, broker reachable via a self-signed self-ping, observed traffic in the last window. Returns PASS/FAIL per component. |
 | `wall_monitor_recent_logs`    | Tail of the in-memory broker log (default 50 lines, max 500). Shows auth rejections, peer IPs, role transitions. |
 | `wall_monitor_provision_hint` | The laptop's LAN IPv4 addresses + the configured port, formatted as `http://…` URLs to paste into the device's captive portal. |
+| `wall_monitor_list_devices`   | Every device in the local registry, with active config version, whether a pending update is queued, last seen, providers enabled. |
+| `wall_monitor_register_device`| Register an existing device — needed once for any device originally provisioned through the captive portal. Args: `device_id` (8 hex), `broker_url`, `psk_hex` (64 hex), optional `city`/`br_day`/`br_night`/`vol`. |
+| `wall_monitor_set_device_pending` | Stage a pending config change. Args (all optional except `device_id`): `broker_url`, `psk_hex`, `city`, `br_day`, `br_night`, `vol`, `provider_claude`, `provider_codex`, `provider_gemini`, `autorotate_enabled`, `autorotate_interval_s`. The device applies it within ~60 s under candidate/rollback. |
+| `wall_monitor_discover_devices` | Scan the local network via mDNS (`_cwm._tcp.local.`) for devices in BOOT_NEEDS_CONFIG. Default 4 s scan, max 15 s. Returns `device_id`, `fw`, `ipv4`, `provision_url`. The pairing code is **not** returned — it lives only on the device's screen. |
+| `wall_monitor_provision`      | POST `/provision` on a discovered device with the 6-digit pairing code the user reads off the screen plus the broker URL, PSK hex, and any optional config. On success the device persists to NVS and reboots; if `broker_url + psk_hex` are supplied this tool also registers/queues the device in the local registry. |
+
+## Per-device control plane
+
+Per-device state lives under `~/.config/claude-wall-monitor/devices/`,
+one `<device_id>.toml` per device. Reads and writes are flock-serialised
+so leader and follower processes can both operate safely.
+
+Schema (truncated example):
+
+```toml
+schema_version = 1
+device_id = "ab12cd34"
+
+[active]
+version = 7
+broker_url = "http://192.168.1.10:8765"
+psk_hex = "0011…"        # 64 hex
+city = "Madrid"
+br_day = 80
+br_night = 20
+vol = 60
+last_seen = 2026-05-22T09:14:00Z
+
+[active.providers]
+claude = true
+codex = false
+gemini = false
+
+# Present only while a change is in flight:
+[pending]
+version = 8
+psk_hex = "ab34…"        # rotation in progress
+city = "Barcelona"
+created_at = 2026-05-22T09:13:00Z
+```
+
+The broker serves `GET /device/<id>/sync`. The pending payload is
+**AES-CTR encrypted with the device's currently-active PSK**, so a
+passive attacker who never broke the active key cannot learn the
+rotated key from a captured response. The wire shape:
+
+```json
+{
+  "active_version": 7,
+  "pending": {
+    "version": 8,
+    "nonce_b64": "…(16 random bytes, base64)…",
+    "payload_b64": "…(AES-CTR ciphertext of the pending TOML, base64)…"
+  }
+}
+```
+
+Promotion (the broker drops the old PSK / commits the new active) only
+fires when the device's next request signs with the **pending** PSK
+AND reports `X-Cwm-Config-Version == pending.version`. Both conditions
+together are the device's "I have applied it" confirmation; either
+alone isn't enough.
+
+## Initial provisioning via mDNS (BOOT_NEEDS_CONFIG)
+
+Devices that finished WiFi association but don't yet have a broker URL
++ PSK sit in **BOOT_NEEDS_CONFIG**: they advertise themselves on
+`_cwm._tcp.local.` (TXT record `device_id`, `state=needs_config`, `fw`)
+and serve HTTP on port 80:
+
+- `GET /info` — public probe, returns `{device_id, fw_version, state,
+  capabilities}`. Safe to call from anywhere on the LAN. **Never**
+  returns the pairing code.
+- `POST /provision` — accepts the initial config. Body shape:
+
+  ```json
+  {
+    "pairing_code": "123456",
+    "broker_url":   "http://192.168.1.10:8765",
+    "psk_hex":      "0011…",
+    "city":         "Madrid",
+    "br_day":       80,
+    "br_night":     20,
+    "vol":          60,
+    "providers":    { "claude": true, "codex": false, "gemini": false }
+  }
+  ```
+
+  All fields except `pairing_code` are optional; only the ones supplied
+  get persisted. The 6-digit `pairing_code` is generated fresh on every
+  boot, shown only on the device's screen, and compared in constant
+  time. A wrong code returns `401`; a successful provision returns
+  `{"ok":true,"device_id":"…","next":"rebooting"}` and the device
+  reboots into BOOT_READY after a short delay.
+
+The `/wall-monitor:configure` Claude Code skill drives this end-to-end
+via `wall_monitor_discover_devices` + `wall_monitor_provision`.
 
 ## Modes & flags
 

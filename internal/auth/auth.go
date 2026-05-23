@@ -2,12 +2,19 @@
 // between the cwm broker and the ESP32 firmware, plus a small TTL nonce
 // cache used to reject replays.
 //
-// Signature input is canonicalised as:
+// Signature input is canonicalised (v2) as:
 //
-//	HMAC-SHA256(psk, "<METHOD>\n<PATH>\n<TIMESTAMP>\n<NONCE>")
+//	HMAC-SHA256(psk,
+//	  "<METHOD>\n<PATH>\n<TIMESTAMP>\n<NONCE>\n<DEVICE>\n<VERSION>")
 //
-// emitted as lowercase hex. The firmware computes the same string before
+// emitted as lowercase hex. DEVICE and VERSION are the X-Cwm-Device and
+// X-Cwm-Config-Version header values verbatim, or the empty string when
+// the header is absent. The firmware computes the same string before
 // every poll, so any drift in this file must be mirrored there.
+//
+// See compat/HMAC_CANONICAL.md for the contract and
+// compat/vectors/hmac.json for the test vectors every implementation
+// must reproduce byte-for-byte.
 package auth
 
 import (
@@ -56,8 +63,11 @@ func (c *NonceCache) reap(now time.Time) {
 }
 
 // ComputeSignature reproduces the canonical request signature returned as
-// lowercase hex.
-func ComputeSignature(psk []byte, method, path, ts, nonce string) string {
+// lowercase hex. Pass the empty string for `device` and/or `configVersion`
+// when the corresponding header is not sent — empty strings still
+// contribute their trailing "\n" separators, so the result is distinct
+// from the deprecated v1 form.
+func ComputeSignature(psk []byte, method, path, ts, nonce, device, configVersion string) string {
 	mac := hmac.New(sha256.New, psk)
 	mac.Write([]byte(method))
 	mac.Write([]byte{'\n'})
@@ -66,6 +76,10 @@ func ComputeSignature(psk []byte, method, path, ts, nonce string) string {
 	mac.Write([]byte(ts))
 	mac.Write([]byte{'\n'})
 	mac.Write([]byte(nonce))
+	mac.Write([]byte{'\n'})
+	mac.Write([]byte(device))
+	mac.Write([]byte{'\n'})
+	mac.Write([]byte(configVersion))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -80,11 +94,12 @@ var (
 
 // Verify checks an incoming request's auth headers against the shared PSK.
 // All non-nil error returns are reasons to reject with 401; never surface them
-// to the client — log internally instead.
+// to the client — log internally instead. Pass deviceHeader/configVersionHeader
+// from r.Header.Get(...) verbatim — empty string when absent.
 func Verify(
 	psk []byte,
 	method, path string,
-	tsHeader, nonceHeader, sigHeader string,
+	tsHeader, nonceHeader, sigHeader, deviceHeader, configVersionHeader string,
 	cache *NonceCache,
 	maxSkew time.Duration,
 	now time.Time,
@@ -107,7 +122,7 @@ func Verify(
 		return ErrBadNonceFormat
 	}
 	nonceLC := strings.ToLower(nonceHeader)
-	expected := ComputeSignature(psk, method, path, strconv.FormatInt(ts, 10), nonceLC)
+	expected := ComputeSignature(psk, method, path, tsHeader, nonceLC, deviceHeader, configVersionHeader)
 	if !hmac.Equal([]byte(strings.ToLower(sigHeader)), []byte(expected)) {
 		return ErrBadSignature
 	}
@@ -132,4 +147,67 @@ func isHex32(s string) bool {
 		}
 	}
 	return true
+}
+
+// VerifyResult tells the caller which PSK satisfied the signature.
+// PSKIndex is the position in the slice passed to VerifyMulti; the
+// broker uses it to spot a "device signed with pending PSK" event and
+// trigger registry.MaybePromote.
+type VerifyResult struct {
+	PSKIndex int
+}
+
+// VerifyMulti tries each PSK in order and returns the first one whose
+// signature matches. Shape checks (timestamp present and parseable,
+// nonce hex32, skew within window) run once; the per-PSK loop only
+// retries the HMAC comparison. The replay nonce is consumed only after
+// a PSK matched, so probing the wrong PSK does not burn the slot for
+// the eventual right one. If every PSK is rejected, returns
+// ErrBadSignature. A nil or empty `psks` slice returns ErrBadSignature.
+func VerifyMulti(
+	psks [][]byte,
+	method, path string,
+	tsHeader, nonceHeader, sigHeader, deviceHeader, configVersionHeader string,
+	cache *NonceCache,
+	maxSkew time.Duration,
+	now time.Time,
+) (VerifyResult, error) {
+	if tsHeader == "" || nonceHeader == "" || sigHeader == "" {
+		return VerifyResult{}, ErrMissingHeaders
+	}
+	ts, err := strconv.ParseInt(tsHeader, 10, 64)
+	if err != nil {
+		return VerifyResult{}, ErrBadTimestamp
+	}
+	skew := now.Unix() - ts
+	if skew < 0 {
+		skew = -skew
+	}
+	if skew > int64(maxSkew/time.Second) {
+		return VerifyResult{}, ErrTimestampSkew
+	}
+	if !isHex32(nonceHeader) {
+		return VerifyResult{}, ErrBadNonceFormat
+	}
+	nonceLC := strings.ToLower(nonceHeader)
+	sigLC := strings.ToLower(sigHeader)
+
+	matchedIdx := -1
+	for i, psk := range psks {
+		if len(psk) == 0 {
+			continue
+		}
+		expected := ComputeSignature(psk, method, path, tsHeader, nonceLC, deviceHeader, configVersionHeader)
+		if hmac.Equal([]byte(sigLC), []byte(expected)) {
+			matchedIdx = i
+			break
+		}
+	}
+	if matchedIdx < 0 {
+		return VerifyResult{}, ErrBadSignature
+	}
+	if !cache.CheckAndAdd(nonceLC, now) {
+		return VerifyResult{}, ErrNonceReplay
+	}
+	return VerifyResult{PSKIndex: matchedIdx}, nil
 }

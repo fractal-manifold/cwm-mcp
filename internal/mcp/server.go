@@ -37,16 +37,20 @@ import (
 	"github.com/fractal-manifold/cwm-mcp/internal/config"
 	"github.com/fractal-manifold/cwm-mcp/internal/creds"
 	"github.com/fractal-manifold/cwm-mcp/internal/logbuf"
+	"github.com/fractal-manifold/cwm-mcp/internal/registry"
 	"github.com/fractal-manifold/cwm-mcp/internal/state"
 )
 
 // Deps bundles everything the tools need; passed into NewServer so the
-// caller controls lifetime.
+// caller controls lifetime. Registry may be nil — when so, the device
+// management tools answer with a "registry disabled" message instead
+// of crashing, mirroring the broker's legacy global-PSK fallback.
 type Deps struct {
-	Cfg     *config.Config
-	State   *state.State
-	Logs    *logbuf.Buffer
-	Version string
+	Cfg      *config.Config
+	State    *state.State
+	Logs     *logbuf.Buffer
+	Registry *registry.Registry
+	Version  string
 }
 
 // NewServer wires the four tools onto a fresh MCP server. Caller is
@@ -99,6 +103,52 @@ func NewServer(d Deps) *server.MCPServer {
 		),
 		handleProvisionHint(d),
 	)
+
+	s.AddTool(
+		mcp.NewTool("wall_monitor_list_devices",
+			mcp.WithDescription("List every device known to the local cwm-mcp registry, with its active config version, whether a pending update is queued, the last time it polled, and which providers are enabled. Returns an empty list when no devices have been registered yet."),
+		),
+		handleListDevices(d),
+	)
+
+	s.AddTool(
+		mcp.NewTool("wall_monitor_register_device",
+			mcp.WithDescription("Register a device in the local registry so its future polls are recognised. Required for any device that was originally provisioned via the captive portal (which doesn't know about device_ids). Pass the device_id printed on the device (or the first 8 hex chars of its MAC), the broker_url it points to, the PSK hex it derived from its passphrase, and any optional config you want to seed."),
+			mcp.WithString("device_id", mcp.Required(), mcp.Description("8 lowercase hex chars (the device prints this in serial logs).")),
+			mcp.WithString("broker_url", mcp.Required(), mcp.Description("HTTP(S) URL of the cwm-mcp broker the device should poll. Use wall_monitor_provision_hint to learn the laptop's reachable address; the URL depends on the user's network.")),
+			mcp.WithString("psk_hex", mcp.Required(), mcp.Description("64 lowercase hex chars; for legacy devices it's sha256(passphrase) hex.")),
+			mcp.WithString("city", mcp.Description("e.g. Madrid")),
+			mcp.WithNumber("br_day", mcp.Description("Daytime brightness, 10..100.")),
+			mcp.WithNumber("br_night", mcp.Description("Nighttime brightness, 5..100.")),
+			mcp.WithNumber("vol", mcp.Description("Alert volume, 0..100.")),
+		),
+		handleRegisterDevice(d),
+	)
+
+	s.AddTool(
+		mcp.NewTool("wall_monitor_set_device_pending",
+			mcp.WithDescription("Stage a pending config update for a registered device. The next time the device polls /device/<id>/sync, it will receive the encrypted payload and apply it under the candidate/rollback safety net. Only fields you supply are changed; omitted fields keep their active value. Setting psk_hex triggers a key rotation that the broker tracks via two-PSK acceptance until the device confirms."),
+			mcp.WithString("device_id", mcp.Required(), mcp.Description("8 lowercase hex chars.")),
+			mcp.WithString("broker_url", mcp.Description("New broker URL.")),
+			mcp.WithString("psk_hex", mcp.Description("New 64-hex PSK to rotate to.")),
+			mcp.WithString("city", mcp.Description("New city for ambient weather.")),
+			mcp.WithNumber("br_day", mcp.Description("Daytime brightness 10..100.")),
+			mcp.WithNumber("br_night", mcp.Description("Nighttime brightness 5..100.")),
+			mcp.WithNumber("vol", mcp.Description("Alert volume 0..100.")),
+			mcp.WithBoolean("provider_claude", mcp.Description("Enable the Claude provider on the device.")),
+			mcp.WithBoolean("provider_codex", mcp.Description("Enable the Codex provider on the device.")),
+			mcp.WithBoolean("provider_gemini", mcp.Description("Enable the Gemini provider on the device.")),
+			mcp.WithBoolean("autorotate_enabled", mcp.Description("Cycle through enabled providers on the dashboard.")),
+			mcp.WithNumber("autorotate_interval_s", mcp.Description("Seconds between provider cycles, 10..300.")),
+			mcp.WithString("theme_mode",
+				mcp.Description("Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). The change takes effect on the reboot that follows promotion."),
+				mcp.Enum("day", "night", "auto"),
+			),
+		),
+		handleSetDevicePending(d),
+	)
+
+	registerDiscoveryTools(s, d)
 
 	return s
 }
@@ -213,7 +263,7 @@ func runSelfPing(ctx context.Context, cfg *config.Config) healthCheck {
 
 	nonce := "1111111111111111deadbeefdeadbeef"
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := auth.ComputeSignature(cfg.PSK(), "GET", "/credentials", ts, nonce)
+	sig := auth.ComputeSignature(cfg.PSK(), "GET", "/credentials", ts, nonce, "", "")
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("X-Cwm-Timestamp", ts)
@@ -292,7 +342,7 @@ func handleFirmwareLogs(d Deps) server.ToolHandlerFunc {
 
 		nonce := freshNonce()
 		ts := strconv.FormatInt(time.Now().Unix(), 10)
-		sig := auth.ComputeSignature(d.Cfg.PSK(), "GET", "/firmware-logs", ts, nonce)
+		sig := auth.ComputeSignature(d.Cfg.PSK(), "GET", "/firmware-logs", ts, nonce, "", "")
 
 		httpReq, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 		httpReq.Header.Set("X-Cwm-Timestamp", ts)

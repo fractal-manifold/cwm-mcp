@@ -72,7 +72,7 @@ func newTestServer(t *testing.T, credsPath string) (*httptest.Server, *config.Co
 	cfg := newTestConfig(t, credsPath)
 	cache := auth.NewNonceCache(time.Duration(cfg.Security.NonceCacheTTLSeconds) * time.Second)
 	logger := log.New(io.Discard, "", 0)
-	ts := httptest.NewServer(NewMux(cfg, cache, state.New(), logger, nil))
+	ts := httptest.NewServer(NewMux(cfg, cache, state.New(), logger, nil, nil))
 	t.Cleanup(ts.Close)
 	return ts, cfg
 }
@@ -81,7 +81,7 @@ func signedRequest(t *testing.T, ts *httptest.Server, cfg *config.Config, nonce 
 	t.Helper()
 	now := time.Now().Unix()
 	tsHdr := strconv.FormatInt(now, 10)
-	sig := auth.ComputeSignature(cfg.PSK(), "GET", "/credentials", tsHdr, nonce)
+	sig := auth.ComputeSignature(cfg.PSK(), "GET", "/credentials", tsHdr, nonce, "", "")
 
 	req, _ := http.NewRequest("GET", ts.URL+"/credentials", nil)
 	req.Header.Set("X-Cwm-Timestamp", tsHdr)
@@ -185,7 +185,7 @@ func TestServer_NonceReplay(t *testing.T) {
 	now := time.Now().Unix()
 	tsHdr := strconv.FormatInt(now, 10)
 	nonce := "fedcba9876543210fedcba9876543210"
-	sig := auth.ComputeSignature(cfg.PSK(), "GET", "/credentials", tsHdr, nonce)
+	sig := auth.ComputeSignature(cfg.PSK(), "GET", "/credentials", tsHdr, nonce, "", "")
 	req, _ := http.NewRequest("GET", ts.URL+"/credentials", nil)
 	req.Header.Set("X-Cwm-Timestamp", tsHdr)
 	req.Header.Set("X-Cwm-Nonce", nonce)

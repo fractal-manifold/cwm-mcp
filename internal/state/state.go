@@ -69,7 +69,11 @@ func (s *State) RecordRequest(remote string, status int, t time.Time) {
 
 // Snapshot is an immutable view suitable for serializing back to MCP
 // callers. Times are zero values if the event has never happened.
+// The Runtime field identifies which language implementation produced
+// this snapshot ("go" | "python" | "js"); it lets the launcher and
+// users see which port answered without having to introspect $PATH.
 type Snapshot struct {
+	Runtime           string    `json:"runtime"`
 	Role              string    `json:"role"`
 	RoleSince         time.Time `json:"role_since"`
 	LastRequestAt     time.Time `json:"last_request_at,omitempty"`
@@ -78,10 +82,16 @@ type Snapshot struct {
 	RequestsTotal     uint64    `json:"requests_total"`
 }
 
+// Runtime is the identifier this implementation reports in the
+// Snapshot. The Go impl is "go"; Python/JS ports must report their own
+// values to keep wall_monitor_status diagnosable end-to-end.
+const Runtime = "go"
+
 func (s *State) Snapshot() Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return Snapshot{
+		Runtime:           Runtime,
 		Role:              s.role.String(),
 		RoleSince:         s.roleSince,
 		LastRequestAt:     s.lastRequestAt,

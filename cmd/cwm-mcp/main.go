@@ -14,6 +14,10 @@
 //   --config   Path to cwm.toml (default: ~/.config/claude-wall-monitor/cwm.toml,
 //              with fallback to service.toml for legacy installations).
 //   --version  Print version and exit.
+//   --probe    Report the runtime ("go") plus version to stderr and exit
+//              0 if this binary is healthy enough for the launcher to
+//              dispatch to it. Used by cwm-mcp-launcher (POSIX sh) to
+//              pick between the Go, Python and JS impls.
 package main
 
 import (
@@ -44,6 +48,8 @@ import (
 	"github.com/fractal-manifold/cwm-mcp/internal/leader"
 	"github.com/fractal-manifold/cwm-mcp/internal/logbuf"
 	"github.com/fractal-manifold/cwm-mcp/internal/mcp"
+	"github.com/fractal-manifold/cwm-mcp/internal/mdns"
+	"github.com/fractal-manifold/cwm-mcp/internal/registry"
 	"github.com/fractal-manifold/cwm-mcp/internal/serial"
 	"github.com/fractal-manifold/cwm-mcp/internal/state"
 )
@@ -59,10 +65,18 @@ func main() {
 	logsMode := flag.Bool("logs", false, "Tail firmware logs from the running broker (Ctrl-C to stop)")
 	logsTail := flag.Int("logs-tail", 50, "How many backlog lines to print before following live (with --logs)")
 	versionFlag := flag.Bool("version", false, "Print version and exit")
+	probeFlag := flag.Bool("probe", false, "Report runtime+version on stderr and exit 0 (used by cwm-mcp-launcher)")
 	flag.Parse()
 
 	if *versionFlag {
 		fmt.Println(Version)
+		return
+	}
+	if *probeFlag {
+		// Launcher convention: stderr only; stdout stays clean. Format
+		// is "<runtime> <version>" so the launcher can use it to
+		// disambiguate which impl answered.
+		fmt.Fprintf(os.Stderr, "go %s\n", Version)
 		return
 	}
 
@@ -96,6 +110,20 @@ func addrOf(cfg *config.Config) string {
 	return net.JoinHostPort(cfg.Server.Bind, strconv.Itoa(cfg.Server.Port))
 }
 
+// openRegistry opens the per-device store under
+// ~/.config/claude-wall-monitor/devices/. A failure is logged but does
+// not abort the broker — the legacy global-PSK path still works without
+// it, and the next /credentials call from a registered device will 401
+// instead of brick-flashing a working setup.
+func openRegistry(logger *log.Logger) *registry.Registry {
+	reg, err := registry.New(config.DevicesPath())
+	if err != nil {
+		logger.Printf("registry: %v (per-device control plane disabled)", err)
+		return nil
+	}
+	return reg
+}
+
 func runOnce(cfg *config.Config) int {
 	c, err := creds.Load(cfg.OAuthPath())
 	if err != nil {
@@ -126,12 +154,31 @@ func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int 
 	fwBuf, fwLogs, stopTailer := startFirmwareTailer(ctx, cfg, logger)
 	defer stopTailer()
 
-	if err := broker.Serve(ctx, ln, cfg, st, logger, fwLogs); err != nil {
+	reg := openRegistry(logger)
+	mdnsPub := startMDNS(ctx, cfg, reg, logger)
+	defer mdnsPub.Close()
+	if err := broker.Serve(ctx, ln, cfg, st, logger, fwLogs, reg); err != nil {
 		logger.Printf("broker: %v", err)
 		return 1
 	}
 	_, _ = logs, fwBuf // retained for symmetry / future diagnostics
 	return 0
+}
+
+// startMDNS launches the broker advertisement. Returns a non-nil
+// *mdns.Publisher even on failure so the caller can defer Close
+// unconditionally. Loopback binds and registry-less setups both yield
+// the no-op publisher.
+func startMDNS(ctx context.Context, cfg *config.Config, reg *registry.Registry, logger *log.Logger) *mdns.Publisher {
+	if reg == nil {
+		return &mdns.Publisher{}
+	}
+	p, err := mdns.Start(ctx, cfg.Server.Bind, cfg.Server.Port, reg, logger)
+	if err != nil {
+		logger.Printf("mdns: %v (broker discovery disabled)", err)
+		return &mdns.Publisher{}
+	}
+	return p
 }
 
 // startFirmwareTailer creates the firmware logbuf and (if configured)
@@ -177,10 +224,11 @@ func runMCP(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
 		defer wg.Done()
 		defer cancel()
 		mcpSrv := mcp.NewServer(mcp.Deps{
-			Cfg:     cfg,
-			State:   st,
-			Logs:    logs,
-			Version: Version,
+			Cfg:      cfg,
+			State:    st,
+			Logs:     logs,
+			Registry: openRegistry(logger),
+			Version:  Version,
 		})
 		if err := mcpserver.ServeStdio(mcpSrv); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Printf("mcp stdio: %v", err)
@@ -195,10 +243,16 @@ func runMCP(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
 		// the device port has exactly one reader. We start it here, scoped
 		// to the listener's context, so it dies cleanly when this peer
 		// loses leadership (or shuts down).
+		reg := openRegistry(logger)
 		err := leader.Run(ctx, addrOf(cfg), st, logger, func(c context.Context, ln net.Listener) error {
 			_, fwLogs, stopTailer := startFirmwareTailer(c, cfg, logger)
 			defer stopTailer()
-			return broker.Serve(c, ln, cfg, st, logger, fwLogs)
+			// mDNS publication is scoped to the leader: only the
+			// process that actually owns the bound port should be
+			// answering "I'm the broker" on the LAN.
+			mdnsPub := startMDNS(c, cfg, reg, logger)
+			defer mdnsPub.Close()
+			return broker.Serve(c, ln, cfg, st, logger, fwLogs, reg)
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			logger.Printf("leader: %v", err)
@@ -226,7 +280,7 @@ func runStatus(cfg *config.Config) int {
 
 	nonce := "0123456789abcdef0123456789abcdef"
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := auth.ComputeSignature(cfg.PSK(), "GET", "/credentials", ts, nonce)
+	sig := auth.ComputeSignature(cfg.PSK(), "GET", "/credentials", ts, nonce, "", "")
 
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("X-Cwm-Timestamp", ts)
@@ -364,7 +418,7 @@ func fetchLogs(ctx context.Context, cfg *config.Config, base string, limit int) 
 	url := base + "?limit=" + strconv.Itoa(limit)
 	nonce := freshHexNonce()
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := auth.ComputeSignature(cfg.PSK(), "GET", "/firmware-logs", ts, nonce)
+	sig := auth.ComputeSignature(cfg.PSK(), "GET", "/firmware-logs", ts, nonce, "", "")
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("X-Cwm-Timestamp", ts)

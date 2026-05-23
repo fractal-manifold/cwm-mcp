@@ -19,9 +19,14 @@ import (
 // exist, Load() falls back to LegacyPath for users still on the older
 // service-go installation.
 const (
-	DefaultPath = "~/.config/claude-wall-monitor/cwm.toml"
-	LegacyPath  = "~/.config/claude-wall-monitor/service.toml"
+	DefaultPath  = "~/.config/claude-wall-monitor/cwm.toml"
+	LegacyPath   = "~/.config/claude-wall-monitor/service.toml"
+	DevicesDir   = "~/.config/claude-wall-monitor/devices"
 )
+
+// DevicesPath returns the absolute path to the per-device registry
+// directory. Exposed so main() can hand it to registry.New.
+func DevicesPath() string { return expandUser(DevicesDir) }
 
 type Config struct {
 	Server      Server      `toml:"server"`

@@ -3,6 +3,7 @@
 #
 # Built binary (root of repo) — produced by `make build` / `make install`
 /cwm-mcp
+/cwm-mcp-go
 
 # Binaries for programs and plugins
 *.exe
