@@ -11,14 +11,17 @@ package mcp
 //
 // Both tools live on the laptop, alongside the broker, and need no signed
 // HMAC: discovery is multicast and /provision is gated by a 6-digit code
-// printed on the device's display (physical-presence proof). The device's
-// PSK only enters the picture after the user passes it in here — we send
-// the desired PSK hex over plain HTTP on the LAN, then the device reboots
-// into BOOT_READY and starts signing.
+// printed on the device's display (physical-presence proof). The PSK is
+// generated server-side: if the caller does not pass psk_hex, we draw 32
+// random bytes with crypto/rand and use that. The result is pushed over
+// plain HTTP on the LAN once (within the brief pairing window) and stored
+// in the registry; the device then reboots into BOOT_READY and signs
+// every subsequent request with it. The user never sees the key.
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -77,7 +80,7 @@ func registerDiscoveryTools(s *server.MCPServer, d Deps) {
 			mcp.WithString("broker_url",
 				mcp.Description("HTTP(S) URL of the cwm-mcp broker the device should poll. Run wall_monitor_provision_hint to learn the laptop's reachable URL on this LAN; do not assume a specific IP. If omitted, only the optional fields below are pushed.")),
 			mcp.WithString("psk_hex",
-				mcp.Description("64-hex PSK the device should sign requests with.")),
+				mcp.Description("Optional 64-hex PSK the device should sign requests with. If omitted (recommended), the broker generates a fresh 32-byte random PSK with crypto/rand and stores it in the registry — the user never has to think of or remember one. Supplying psk_hex is only needed when reproducing an existing PSK (e.g. migrating a device between brokers).")),
 			mcp.WithString("city", mcp.Description("Optional city for ambient weather.")),
 			mcp.WithNumber("br_day",   mcp.Description("Daytime brightness 10..100.")),
 			mcp.WithNumber("br_night", mcp.Description("Nighttime brightness 5..100.")),
@@ -206,6 +209,7 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 
 		brokerURL := strings.TrimSpace(req.GetString("broker_url", ""))
 		pskHex := strings.ToLower(strings.TrimSpace(req.GetString("psk_hex", "")))
+		pskGenerated := false
 		if pskHex != "" {
 			if len(pskHex) != 64 {
 				return mcp.NewToolResultError("psk_hex must be 64 hex chars"), nil
@@ -213,6 +217,19 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 			if _, err := hex.DecodeString(pskHex); err != nil {
 				return mcp.NewToolResultError("psk_hex is not valid hex"), nil
 			}
+		} else if brokerURL != "" {
+			// No PSK supplied for a full provision — generate one. The
+			// user never has to memorise a passphrase or pick a key:
+			// pairing-code physical-presence proof + a fresh 32-byte
+			// random PSK is strictly stronger than the old
+			// SHA-256(passphrase) derivation, and the secret stays
+			// machine-only (broker registry + device NVS).
+			b := make([]byte, 32)
+			if _, err := rand.Read(b); err != nil {
+				return mcp.NewToolResultErrorFromErr("psk gen", err), nil
+			}
+			pskHex = hex.EncodeToString(b)
+			pskGenerated = true
 		}
 
 		payload := provisionPayload{
@@ -340,6 +357,7 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 			DeviceID     string `json:"device_id"`
 			Registered   bool   `json:"registered"`
 			Reregistered bool   `json:"reregistered,omitempty"`
+			PSKGenerated bool   `json:"psk_generated,omitempty"`
 			Note         string `json:"note,omitempty"`
 			DeviceResp   any    `json:"device_response,omitempty"`
 		}{
@@ -347,6 +365,7 @@ func handleProvision(d Deps) server.ToolHandlerFunc {
 			DeviceID:     deviceID,
 			Registered:   registered,
 			Reregistered: reregistered,
+			PSKGenerated: pskGenerated,
 		}
 		if registryErr != nil {
 			out.Note = "device provisioned but registry write failed: " + registryErr.Error()
