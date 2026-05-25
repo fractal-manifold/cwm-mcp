@@ -2,6 +2,7 @@ package usage
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -115,9 +116,28 @@ func scanDirForGeminiOAuth(root string) (geminiOAuthClient, bool) {
 }
 
 func extractGeminiOAuthFromBundle(data []byte) (geminiOAuthClient, bool) {
-	id := geminiClientIDRe.Find(data)
+	// The bundle commonly contains two installed-app client IDs: the
+	// gemini-cli one (right next to the OAUTH_CLIENT_SECRET literal) and
+	// an unrelated Cloud SDK one earlier in the file. Naively taking
+	// regexp.Find of each yields a mismatched pair. We anchor on the
+	// secret (which is unique to gemini-cli in the bundle) and search
+	// the surrounding window for its paired client ID.
 	sec := geminiClientSecretRe.Find(data)
-	if len(id) == 0 || len(sec) == 0 {
+	if len(sec) == 0 {
+		return geminiOAuthClient{}, false
+	}
+	secIdx := bytes.Index(data, sec)
+	const window = 2048
+	start := secIdx - window
+	if start < 0 {
+		start = 0
+	}
+	end := secIdx + len(sec) + window
+	if end > len(data) {
+		end = len(data)
+	}
+	id := geminiClientIDRe.Find(data[start:end])
+	if len(id) == 0 {
 		return geminiOAuthClient{}, false
 	}
 	return geminiOAuthClient{ID: string(id), Secret: string(sec)}, true
