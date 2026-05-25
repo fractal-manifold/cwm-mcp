@@ -52,6 +52,7 @@ import (
 	"github.com/fractal-manifold/cwm-mcp/internal/registry"
 	"github.com/fractal-manifold/cwm-mcp/internal/serial"
 	"github.com/fractal-manifold/cwm-mcp/internal/state"
+	"github.com/fractal-manifold/cwm-mcp/internal/usage"
 )
 
 // Version is overridden at build time via -ldflags "-X main.Version=...".
@@ -157,7 +158,8 @@ func runDaemon(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int 
 	reg := openRegistry(logger)
 	mdnsPub := startMDNS(ctx, cfg, reg, logger)
 	defer mdnsPub.Close()
-	if err := broker.Serve(ctx, ln, cfg, st, logger, fwLogs, reg); err != nil {
+	usageCache := buildUsageCache(cfg, logger)
+	if err := broker.Serve(ctx, ln, cfg, st, logger, fwLogs, reg, usageCache); err != nil {
 		logger.Printf("broker: %v", err)
 		return 1
 	}
@@ -179,6 +181,40 @@ func startMDNS(ctx context.Context, cfg *config.Config, reg *registry.Registry, 
 		return &mdns.Publisher{}
 	}
 	return p
+}
+
+// buildUsageCache wires the per-provider Fetchers into a *usage.Cache.
+// Each provider is opt-in via [provider].enabled in cwm.toml — Claude is
+// always wired (it's the primary use case), Codex and Gemini only when
+// the user explicitly enabled them. Returns nil when no provider is
+// enabled, which makes broker /usage/* answer 503 with a clear message.
+func buildUsageCache(cfg *config.Config, logger *log.Logger) *usage.Cache {
+	fetchers := map[string]usage.Fetcher{}
+	fetchers[usage.ProviderClaude] = &usage.ClaudeFetcher{OAuthPath: cfg.OAuthPath()}
+	if cfg.Codex.Enabled {
+		fetchers[usage.ProviderCodex] = &usage.CodexFetcher{AuthPath: cfg.CodexAuthPath()}
+	}
+	if cfg.Gemini.Enabled {
+		fetchers[usage.ProviderGemini] = &usage.GeminiFetcher{
+			CredsPath:    cfg.GeminiCredsPath(),
+			ProjectsPath: cfg.GeminiProjectsPath(),
+			Models:       cfg.GeminiModels(),
+		}
+	}
+	ttl := time.Duration(cfg.Usage.CacheTTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+	logger.Printf("usage: providers=%v cache_ttl=%s", keysOf(fetchers), ttl)
+	return usage.NewCache(ttl, fetchers)
+}
+
+func keysOf(m map[string]usage.Fetcher) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // startFirmwareTailer creates the firmware logbuf and (if configured)
@@ -252,7 +288,8 @@ func runMCP(cfg *config.Config, logger *log.Logger, logs *logbuf.Buffer) int {
 			// answering "I'm the broker" on the LAN.
 			mdnsPub := startMDNS(c, cfg, reg, logger)
 			defer mdnsPub.Close()
-			return broker.Serve(c, ln, cfg, st, logger, fwLogs, reg)
+			usageCache := buildUsageCache(cfg, logger)
+			return broker.Serve(c, ln, cfg, st, logger, fwLogs, reg, usageCache)
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			logger.Printf("leader: %v", err)

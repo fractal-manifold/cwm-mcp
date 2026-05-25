@@ -67,6 +67,11 @@ type ConfigPayload struct {
 	// opinion" / "don't touch on the device" for partial pending updates;
 	// see compat/tool-schemas.json for the enum.
 	ThemeMode            string       `toml:"theme_mode,omitempty"`
+	// GeminiModels overrides service.toml [gemini].models for this
+	// device. The broker honours this list when serving /usage/gemini
+	// for the device. Empty means "use the global default". Max 3 entries;
+	// excess is silently clamped on the broker side.
+	GeminiModels         []string     `toml:"gemini_models,omitempty"`
 }
 
 type Active struct {
@@ -503,6 +508,12 @@ func mergePayload(base, upd ConfigPayload) ConfigPayload {
 	if upd.ThemeMode != "" {
 		out.ThemeMode = upd.ThemeMode
 	}
+	if upd.GeminiModels != nil {
+		// Copy so callers can't mutate the stored slice afterwards.
+		m := make([]string, len(upd.GeminiModels))
+		copy(m, upd.GeminiModels)
+		out.GeminiModels = m
+	}
 	return out
 }
 
@@ -533,6 +544,21 @@ func payloadEquivalent(a, b ConfigPayload) bool {
 	}
 	if !ptrU16Equal(a.AutorotateIntervalS, b.AutorotateIntervalS) {
 		return false
+	}
+	if !strSliceEqual(a.GeminiModels, b.GeminiModels) {
+		return false
+	}
+	return true
+}
+
+func strSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
 	}
 	return true
 }

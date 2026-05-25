@@ -89,7 +89,22 @@ func pendingChanges(active, pending registry.ConfigPayload) []string {
 	if pending.ThemeMode != "" && pending.ThemeMode != active.ThemeMode {
 		diffs = append(diffs, "theme_mode")
 	}
+	if pending.GeminiModels != nil && !stringSliceEqual(active.GeminiModels, pending.GeminiModels) {
+		diffs = append(diffs, "gemini_models")
+	}
 	return diffs
+}
+
+func stringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func summarise(dev *registry.Device) deviceSummary {
@@ -281,6 +296,20 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 			update.ThemeMode = tm
 		}
 
+		// gemini_models: comma-separated list. Empty string clears the
+		// override (signalled by an empty-but-non-nil slice; mergePayload
+		// then replaces the stored list).
+		if raw, ok := req.GetArguments()["gemini_models"]; ok {
+			models := parseGeminiModels(fmt.Sprint(raw))
+			if len(models) > 3 {
+				return mcp.NewToolResultError("gemini_models must list at most 3 entries"), nil
+			}
+			if models == nil {
+				models = []string{}
+			}
+			update.GeminiModels = models
+		}
+
 		dev, err := d.Registry.SetPending(deviceID, update)
 		if err != nil {
 			if errors.Is(err, registry.ErrNotFound) {
@@ -293,6 +322,27 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 			Device deviceSummary `json:"device"`
 		}{OK: true, Device: summarise(dev)})
 	}
+}
+
+// parseGeminiModels splits a comma-separated list of model IDs and
+// trims whitespace. Returns an empty slice (not nil) when the input is
+// empty after trimming, so callers can distinguish "clear the override"
+// (empty slice) from "field not provided" (nil).
+func parseGeminiModels(raw string) []string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return []string{}
+	}
+	parts := strings.Split(trimmed, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		s := strings.TrimSpace(p)
+		if s == "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 func clamp8(v, lo, hi uint8) uint8 {

@@ -26,6 +26,7 @@ import (
 	"github.com/fractal-manifold/cwm-mcp/internal/logbuf"
 	"github.com/fractal-manifold/cwm-mcp/internal/registry"
 	"github.com/fractal-manifold/cwm-mcp/internal/state"
+	"github.com/fractal-manifold/cwm-mcp/internal/usage"
 )
 
 // FirmwareLogSource is the read-side interface the broker needs to serve
@@ -90,7 +91,7 @@ func (r *statusRecorder) WriteHeader(s int) {
 // null source that answers 200 with an empty list. `reg` may be nil
 // — when missing, /credentials falls back to the global PSK in cfg
 // (legacy mode) and /device/* answers 404.
-func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger *log.Logger, fwLogs FirmwareLogSource, reg *registry.Registry) *http.ServeMux {
+func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger *log.Logger, fwLogs FirmwareLogSource, reg *registry.Registry, usageCache *usage.Cache) *http.ServeMux {
 	if fwLogs == nil {
 		fwLogs = nullFirmwareLogs{}
 	}
@@ -102,12 +103,26 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
 		}
 	})
+	mux.HandleFunc("/credentials/codex", func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		handleCodexCredentials(cfg, cache, logger, reg, rec, r)
+		if st != nil {
+			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
+		}
+	})
 	mux.HandleFunc("/firmware-logs", func(w http.ResponseWriter, r *http.Request) {
 		handleFirmwareLogs(cfg, cache, logger, fwLogs, w, r)
 	})
 	mux.HandleFunc("/device/", func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		handleDeviceSync(cfg, cache, logger, reg, rec, r)
+		if st != nil {
+			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
+		}
+	})
+	mux.HandleFunc("/usage/", func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		handleUsage(cfg, cache, logger, reg, usageCache, rec, r)
 		if st != nil {
 			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
 		}
@@ -182,73 +197,8 @@ func handleCredentials(cfg *config.Config, cache *auth.NonceCache, logger *log.L
 		return
 	}
 
-	// Per-device path: when X-Cwm-Device is present AND we have a
-	// registry, look up the device's PSKs and verify with VerifyMulti.
-	// A successful pending-PSK signature plus the version it implies
-	// triggers MaybePromote so the broker tracks the rotation. When the
-	// header is missing or no registry exists, fall back to the legacy
-	// global-PSK path so field devices keep working.
-	deviceID := r.Header.Get("X-Cwm-Device")
-	if reg != nil && deviceID != "" {
-		if !registry.ValidDeviceID(deviceID) {
-			writeError(w, http.StatusBadRequest, "invalid device_id")
-			return
-		}
-		active, pending, perr := reg.PSKsFor(deviceID)
-		if errors.Is(perr, registry.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "unknown device")
-			return
-		} else if perr != nil {
-			logger.Printf("registry lookup %s: %v", deviceID, perr)
-			writeError(w, http.StatusInternalServerError, "registry error")
-			return
-		}
-		res, verr := auth.VerifyMulti(
-			[][]byte{active, pending},
-			"GET", "/credentials",
-			r.Header.Get("X-Cwm-Timestamp"),
-			r.Header.Get("X-Cwm-Nonce"),
-			r.Header.Get("X-Cwm-Signature"),
-			r.Header.Get("X-Cwm-Device"),
-			r.Header.Get("X-Cwm-Config-Version"),
-			cache,
-			time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
-			time.Now(),
-		)
-		if verr != nil {
-			logger.Printf("auth rejected /credentials device=%s from %s: %v", deviceID, r.RemoteAddr, verr)
-			writeError(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-		// Attempt promotion on every authenticated request. MaybePromote
-		// itself decides whether the signature proves the rotation
-		// (pending PSK used) or — for non-key-rotation pending updates
-		// like theme / city / brightness — whether the version header
-		// alone with the active PSK is enough.
-		obs, _ := parseUint32Header(r.Header.Get("X-Cwm-Config-Version"))
-		if _, perr := reg.MaybePromote(deviceID, obs, res.PSKIndex == 1); perr != nil {
-			logger.Printf("registry promote %s: %v", deviceID, perr)
-		}
-		if terr := reg.Touch(deviceID); terr != nil {
-			logger.Printf("registry touch %s: %v", deviceID, terr)
-		}
-	} else {
-		if err := auth.Verify(
-			cfg.PSK(),
-			"GET", "/credentials",
-			r.Header.Get("X-Cwm-Timestamp"),
-			r.Header.Get("X-Cwm-Nonce"),
-			r.Header.Get("X-Cwm-Signature"),
-			r.Header.Get("X-Cwm-Device"),
-			r.Header.Get("X-Cwm-Config-Version"),
-			cache,
-			time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
-			time.Now(),
-		); err != nil {
-			logger.Printf("auth rejected from %s: %v", r.RemoteAddr, err)
-			writeError(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
+	if !verifyCredentialRequest(cfg, cache, logger, reg, w, r, "/credentials") {
+		return
 	}
 
 	c, err := creds.Load(cfg.OAuthPath())
@@ -278,6 +228,242 @@ func handleCredentials(cfg *config.Config, cache *auth.NonceCache, logger *log.L
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+func handleCodexCredentials(cfg *config.Config, cache *auth.NonceCache, logger *log.Logger, reg *registry.Registry, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !verifyCredentialRequest(cfg, cache, logger, reg, w, r, "/credentials/codex") {
+		return
+	}
+	if !cfg.Codex.Enabled {
+		writeError(w, http.StatusNotFound, "codex provider disabled")
+		return
+	}
+
+	c, err := creds.LoadCodex(cfg.CodexAuthPath())
+	switch {
+	case errors.Is(err, creds.ErrFileMissing):
+		// Missing auth is recoverable: keep the firmware retrying instead
+		// of treating Codex as absent for the rest of the boot.
+		writeError(w, http.StatusServiceUnavailable, "codex credentials file missing")
+		return
+	case err != nil:
+		logger.Printf("cannot parse codex credentials: %v", err)
+		writeError(w, http.StatusInternalServerError, "cannot read codex credentials")
+		return
+	}
+	if c.IsExpired(time.Now()) {
+		writeError(w, http.StatusServiceUnavailable, "codex token expired, refresh on laptop")
+		return
+	}
+
+	body, _ := json.Marshal(struct {
+		AccessToken string `json:"access_token"`
+		ExpiresAt   string `json:"expires_at"`
+		AccountID   string `json:"account_id"`
+	}{
+		AccessToken: c.AccessToken,
+		ExpiresAt:   c.ExpiresAtISO(),
+		AccountID:   c.AccountID,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+func verifyCredentialRequest(cfg *config.Config, cache *auth.NonceCache, logger *log.Logger, reg *registry.Registry, w http.ResponseWriter, r *http.Request, path string) bool {
+	// Per-device path: when X-Cwm-Device is present AND we have a
+	// registry, look up the device's PSKs and verify with VerifyMulti.
+	// A successful pending-PSK signature plus the version it implies
+	// triggers MaybePromote so the broker tracks the rotation. When the
+	// header is missing or no registry exists, fall back to the legacy
+	// global-PSK path so field devices keep working.
+	deviceID := r.Header.Get("X-Cwm-Device")
+	if reg != nil && deviceID != "" {
+		if !registry.ValidDeviceID(deviceID) {
+			writeError(w, http.StatusBadRequest, "invalid device_id")
+			return false
+		}
+		active, pending, perr := reg.PSKsFor(deviceID)
+		if errors.Is(perr, registry.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "unknown device")
+			return false
+		} else if perr != nil {
+			logger.Printf("registry lookup %s: %v", deviceID, perr)
+			writeError(w, http.StatusInternalServerError, "registry error")
+			return false
+		}
+		res, verr := auth.VerifyMulti(
+			[][]byte{active, pending},
+			"GET", path,
+			r.Header.Get("X-Cwm-Timestamp"),
+			r.Header.Get("X-Cwm-Nonce"),
+			r.Header.Get("X-Cwm-Signature"),
+			r.Header.Get("X-Cwm-Device"),
+			r.Header.Get("X-Cwm-Config-Version"),
+			cache,
+			time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
+			time.Now(),
+		)
+		if verr != nil {
+			logger.Printf("auth rejected %s device=%s from %s: %v", path, deviceID, r.RemoteAddr, verr)
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return false
+		}
+		obs, _ := parseUint32Header(r.Header.Get("X-Cwm-Config-Version"))
+		if _, perr := reg.MaybePromote(deviceID, obs, res.PSKIndex == 1); perr != nil {
+			logger.Printf("registry promote %s: %v", deviceID, perr)
+		}
+		if terr := reg.Touch(deviceID); terr != nil {
+			logger.Printf("registry touch %s: %v", deviceID, terr)
+		}
+		return true
+	}
+
+	if err := auth.Verify(
+		cfg.PSK(),
+		"GET", path,
+		r.Header.Get("X-Cwm-Timestamp"),
+		r.Header.Get("X-Cwm-Nonce"),
+		r.Header.Get("X-Cwm-Signature"),
+		r.Header.Get("X-Cwm-Device"),
+		r.Header.Get("X-Cwm-Config-Version"),
+		cache,
+		time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
+		time.Now(),
+	); err != nil {
+		logger.Printf("auth rejected %s from %s: %v", path, r.RemoteAddr, err)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return false
+	}
+	return true
+}
+
+// handleUsage serves GET /usage/{provider}. Authenticates with the same
+// HMAC envelope as /credentials (per-device or legacy global PSK). On
+// upstream success returns the cached Snapshot as JSON; on upstream
+// failure with a previously-cached value, returns the stale snapshot
+// with 200 + an X-Cwm-Stale-Reason header so the firmware can keep
+// rendering while logging the drift.
+func handleUsage(cfg *config.Config, nonceCache *auth.NonceCache, logger *log.Logger, reg *registry.Registry, usageCache *usage.Cache, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	// Path is /usage/<provider>; reject anything deeper to avoid
+	// silently serving /usage/claude/extra as claude.
+	provider := strings.TrimPrefix(r.URL.Path, "/usage/")
+	if provider == "" || strings.ContainsRune(provider, '/') {
+		writeError(w, http.StatusNotFound, "unknown usage provider")
+		return
+	}
+	if !verifyCredentialRequest(cfg, nonceCache, logger, reg, w, r, "/usage/"+provider) {
+		return
+	}
+	if usageCache == nil {
+		writeError(w, http.StatusServiceUnavailable, "usage disabled (no providers configured)")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	// Per-device Gemini override: when the device's registry record has
+	// a non-empty gemini_models list, bypass the shared cache so we
+	// serve the requested model slice. The token cache inside the
+	// GeminiFetcher is still reused, so this is only one extra
+	// upstream round-trip per poll.
+	deviceID := r.Header.Get("X-Cwm-Device")
+	if provider == usage.ProviderGemini && reg != nil && deviceID != "" && registry.ValidDeviceID(deviceID) {
+		if models := deviceGeminiModels(reg, deviceID); len(models) > 0 {
+			if gf, ok := usageCache.GeminiFetcher(); ok {
+				snap, ferr := gf.FetchWithModels(ctx, models)
+				if ferr != nil {
+					status, msg := usageErrorToHTTP(ferr)
+					writeError(w, status, msg)
+					return
+				}
+				snap.FetchedAtUnix = time.Now().Unix()
+				writeJSON(w, http.StatusOK, snap)
+				return
+			}
+		}
+	}
+
+	snap, err := usageCache.Get(ctx, provider)
+	if err != nil {
+		// Stale-with-error: cache returned the last good snapshot
+		// alongside a transient error. Surface the snapshot and a
+		// header so the firmware can log the staleness without
+		// blanking the UI.
+		if snap.FetchedAtUnix > 0 {
+			w.Header().Set("X-Cwm-Stale-Reason", err.Error())
+			writeJSON(w, http.StatusOK, snap)
+			return
+		}
+		status, msg := usageErrorToHTTP(err)
+		writeError(w, status, msg)
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
+}
+
+// deviceGeminiModels returns the registry's per-device gemini_models
+// override for the given device. Prefers an in-flight pending list (so
+// the override applies as soon as it's staged, without waiting for a
+// promotion) but falls back to the active value. Returns nil when no
+// record exists or the field is empty.
+func deviceGeminiModels(reg *registry.Registry, deviceID string) []string {
+	dev, err := reg.Load(deviceID)
+	if err != nil || dev == nil {
+		return nil
+	}
+	if dev.Pending != nil && len(dev.Pending.GeminiModels) > 0 {
+		out := make([]string, len(dev.Pending.GeminiModels))
+		copy(out, dev.Pending.GeminiModels)
+		return out
+	}
+	if len(dev.Active.GeminiModels) > 0 {
+		out := make([]string, len(dev.Active.GeminiModels))
+		copy(out, dev.Active.GeminiModels)
+		return out
+	}
+	return nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	body, _ := json.Marshal(v)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+func usageErrorToHTTP(err error) (int, string) {
+	switch {
+	case errors.Is(err, usage.ErrCredsMissing):
+		return http.StatusNotFound, "creds file missing"
+	case errors.Is(err, usage.ErrTokenExpired):
+		return http.StatusServiceUnavailable, "token expired, refresh on laptop"
+	case errors.Is(err, usage.ErrUnauthorized):
+		return http.StatusUnauthorized, "upstream rejected token"
+	case errors.Is(err, usage.ErrRateLimited):
+		return http.StatusTooManyRequests, "rate limited"
+	case errors.Is(err, usage.ErrNotImpl), errors.Is(err, usage.ErrDisabled):
+		return http.StatusNotImplemented, "provider not enabled"
+	case errors.Is(err, usage.ErrTransport):
+		return http.StatusBadGateway, "transport error"
+	case errors.Is(err, usage.ErrUpstream), errors.Is(err, usage.ErrParseUpstream):
+		return http.StatusBadGateway, "upstream error"
+	default:
+		return http.StatusInternalServerError, "internal error"
+	}
 }
 
 // pendingBlob is the wire format of an encrypted pending payload.
@@ -342,6 +528,15 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 		// blob and writes it to KEY_THEME_MD. Omitting it here would
 		// silently no-op /wall-monitor:theme switches.
 		wire["theme_mode"] = p.ThemeMode
+	}
+	if len(p.GeminiModels) > 0 {
+		// firmware/config_sync.c reads "gemini_models" as a CSV string
+		// and writes it to NVS key cwm_gem_mdls. The device uses it
+		// purely as a hint for /usage/gemini polling (the broker also
+		// looks at the registry override directly); persisting it on
+		// device makes the override observable in Settings and survive
+		// broker restarts before the next sync.
+		wire["gemini_models"] = strings.Join(p.GeminiModels, ",")
 	}
 	return json.Marshal(wire)
 }
@@ -488,10 +683,10 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // `fwLogs` is the read-side of the serial tailer; pass nil to keep
 // /firmware-logs answering 200 with an empty list. `reg` may be nil
 // to disable the per-device control plane (legacy global-PSK mode).
-func Serve(ctx context.Context, ln net.Listener, cfg *config.Config, st *state.State, logger *log.Logger, fwLogs FirmwareLogSource, reg *registry.Registry) error {
+func Serve(ctx context.Context, ln net.Listener, cfg *config.Config, st *state.State, logger *log.Logger, fwLogs FirmwareLogSource, reg *registry.Registry, usageCache *usage.Cache) error {
 	cache := auth.NewNonceCache(time.Duration(cfg.Security.NonceCacheTTLSeconds) * time.Second)
 	srv := &http.Server{
-		Handler:           NewMux(cfg, cache, st, logger, fwLogs, reg),
+		Handler:           NewMux(cfg, cache, st, logger, fwLogs, reg, usageCache),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

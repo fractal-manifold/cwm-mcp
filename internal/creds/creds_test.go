@@ -1,6 +1,7 @@
 package creds
 
 import (
+	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
@@ -62,5 +63,71 @@ func TestStored_IsExpired(t *testing.T) {
 	}
 	if c.IsExpired(time.UnixMilli(500)) {
 		t.Error("not yet expired at 500ms")
+	}
+}
+
+func TestLoadCodex_HappyNested(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(p,
+		[]byte(`{"tokens":{"access_token":"tok","account_id":"acct"},"expires_at":"2026-01-02T03:04:05Z"}`),
+		0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadCodex(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AccessToken != "tok" || c.AccountID != "acct" {
+		t.Fatalf("codex creds = %+v", c)
+	}
+	if c.ExpiresAtISO() != "2026-01-02T03:04:05.000Z" {
+		t.Fatalf("expires = %s", c.ExpiresAtISO())
+	}
+}
+
+func TestLoadCodex_HappyFlatEpochSeconds(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(p,
+		[]byte(`{"access_token":"tok","account_id":"acct","expires_at":1700000000}`),
+		0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadCodex(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ExpiresAtUnixMS != 1700000000000 {
+		t.Fatalf("expires ms = %d", c.ExpiresAtUnixMS)
+	}
+}
+
+func TestLoadCodex_ExpiresFromJWT(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "auth.json")
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"exp":1700000000}`))
+	jwt := header + "." + payload + ".sig"
+	body := `{"tokens":{"access_token":"` + jwt + `","account_id":"acct"}}`
+	if err := os.WriteFile(p, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadCodex(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ExpiresAtUnixMS != 1700000000000 {
+		t.Fatalf("expires ms = %d", c.ExpiresAtUnixMS)
+	}
+}
+
+func TestLoadCodex_MissingAccount(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "auth.json")
+	os.WriteFile(p, []byte(`{"access_token":"tok","expires_at":1700000000}`), 0600)
+	_, err := LoadCodex(p)
+	if !errors.Is(err, ErrParse) || !errors.Is(err, ErrCodexNoAccount) {
+		t.Fatalf("expected ErrParse wrapping ErrCodexNoAccount, got %v", err)
 	}
 }

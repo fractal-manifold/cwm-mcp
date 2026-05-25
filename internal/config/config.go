@@ -19,9 +19,9 @@ import (
 // exist, Load() falls back to LegacyPath for users still on the older
 // service-go installation.
 const (
-	DefaultPath  = "~/.config/claude-wall-monitor/cwm.toml"
-	LegacyPath   = "~/.config/claude-wall-monitor/service.toml"
-	DevicesDir   = "~/.config/claude-wall-monitor/devices"
+	DefaultPath = "~/.config/claude-wall-monitor/cwm.toml"
+	LegacyPath  = "~/.config/claude-wall-monitor/service.toml"
+	DevicesDir  = "~/.config/claude-wall-monitor/devices"
 )
 
 // DevicesPath returns the absolute path to the per-device registry
@@ -32,6 +32,9 @@ type Config struct {
 	Server      Server      `toml:"server"`
 	Auth        Auth        `toml:"auth"`
 	Credentials Credentials `toml:"credentials"`
+	Codex       Codex       `toml:"codex"`
+	Gemini      Gemini      `toml:"gemini"`
+	Usage       Usage       `toml:"usage"`
 	Security    Security    `toml:"security"`
 	Logging     Logging     `toml:"logging"`
 	Serial      Serial      `toml:"serial"`
@@ -50,6 +53,57 @@ type Auth struct {
 
 type Credentials struct {
 	OAuthPath string `toml:"oauth_path"`
+}
+
+type Codex struct {
+	Enabled  bool   `toml:"enabled"`
+	AuthPath string `toml:"auth_path"`
+}
+
+// Gemini configures the loadCodeAssist usage probe. CredsPath points at
+// the Gemini CLI's oauth_creds.json; ProjectsPath at its projects.json
+// (used to derive a cloudaicompanionProject — any of the user's projects
+// works). Both are optional; loadCodeAssist accepts an empty project.
+//
+// Models is the ordered list of Gemini model IDs the broker surfaces in
+// the `slots` array on /usage/gemini. Max 3 entries — the firmware only
+// renders that many cards. Empty falls back to DefaultGeminiModels.
+type Gemini struct {
+	Enabled      bool     `toml:"enabled"`
+	CredsPath    string   `toml:"creds_path"`
+	ProjectsPath string   `toml:"projects_path"`
+	Models       []string `toml:"models"`
+}
+
+// DefaultGeminiModels is what the broker exposes when [gemini].models is
+// empty. Pro is the headline model users care most about; Flash is the
+// high-volume bucket that burns the fastest.
+var DefaultGeminiModels = []string{"gemini-2.5-pro", "gemini-2.5-flash"}
+
+// MaxGeminiModels caps the number of model slots the broker emits — the
+// firmware dashboard has 3 fixed card slots (large/large/small) and
+// ignores anything past index 2.
+const MaxGeminiModels = 3
+
+// GeminiModels returns the configured list, clamped to MaxGeminiModels.
+// An empty config returns DefaultGeminiModels.
+func (c *Config) GeminiModels() []string {
+	src := c.Gemini.Models
+	if len(src) == 0 {
+		src = DefaultGeminiModels
+	}
+	if len(src) > MaxGeminiModels {
+		src = src[:MaxGeminiModels]
+	}
+	out := make([]string, len(src))
+	copy(out, src)
+	return out
+}
+
+// Usage controls the cache TTL for /usage/{provider}. A device polling
+// every 60 s with default TTL hits each upstream at most once per minute.
+type Usage struct {
+	CacheTTLSeconds int `toml:"cache_ttl_seconds"`
 }
 
 type Security struct {
@@ -75,6 +129,18 @@ func (c *Config) PSK() []byte { return c.pskBytes }
 
 func (c *Config) OAuthPath() string {
 	return expandUser(c.Credentials.OAuthPath)
+}
+
+func (c *Config) CodexAuthPath() string {
+	return expandUser(c.Codex.AuthPath)
+}
+
+func (c *Config) GeminiCredsPath() string {
+	return expandUser(c.Gemini.CredsPath)
+}
+
+func (c *Config) GeminiProjectsPath() string {
+	return expandUser(c.Gemini.ProjectsPath)
 }
 
 func expandUser(p string) string {
@@ -145,6 +211,20 @@ func defaults() *Config {
 		Credentials: Credentials{
 			OAuthPath: "~/.claude/.credentials.json",
 		},
+		Codex: Codex{
+			Enabled:  false,
+			AuthPath: "~/.codex/auth.json",
+		},
+		Gemini: Gemini{
+			Enabled:      false,
+			CredsPath:    "~/.gemini/oauth_creds.json",
+			ProjectsPath: "~/.gemini/projects.json",
+			// Models left nil so GeminiModels() returns the default —
+			// keeps the zero value useful for tests that don't load TOML.
+		},
+		Usage: Usage{
+			CacheTTLSeconds: 30,
+		},
 		Security: Security{
 			MaxTimestampSkewSeconds: 60,
 			NonceCacheTTLSeconds:    300,
@@ -169,6 +249,33 @@ psk_passphrase = "change-me-please"
 
 [credentials]
 oauth_path = "~/.claude/.credentials.json"
+
+[codex]
+# Enable if you also use the Codex CLI. auth.json contains the ChatGPT
+# bearer token plus account_id required by /backend-api/wham/usage.
+enabled = false
+auth_path = "~/.codex/auth.json"
+
+[gemini]
+# Enable if you also use the Gemini CLI. The broker reads the OAuth creds
+# the CLI writes, refreshes the access token in memory when needed (never
+# writing back to avoid racing the CLI), and asks cloudcode-pa for the
+# tier. Free tier returns no usage signal; paid tier returns credits.
+enabled = false
+creds_path = "~/.gemini/oauth_creds.json"
+projects_path = "~/.gemini/projects.json"
+# Models exposed as dashboard cards (max 3). Default is Pro + Flash.
+# Each entry is a Gemini model ID; prefix matches are tolerated so
+# "gemini-2.5-flash" also resolves "gemini-2.5-flash-002" if Google
+# rotates suffixes. Per-device overrides live in the registry under
+# gemini_models (pushed through /device/<id>/sync).
+# models = ["gemini-2.5-pro", "gemini-2.5-flash"]
+
+[usage]
+# How long the broker caches each provider's /usage payload before
+# re-fetching upstream. A device polling every 60 s with TTL 30 s hits
+# each upstream once per minute at most.
+cache_ttl_seconds = 30
 
 [security]
 max_timestamp_skew_seconds = 60

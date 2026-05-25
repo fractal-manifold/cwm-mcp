@@ -38,7 +38,7 @@ func newDeviceSyncServer(t *testing.T) (*httptest.Server, *registry.Registry) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := httptest.NewServer(NewMux(cfg, cache, state.New(), logger, nil, reg))
+	ts := httptest.NewServer(NewMux(cfg, cache, state.New(), logger, nil, reg, nil))
 	t.Cleanup(ts.Close)
 	return ts, reg
 }
