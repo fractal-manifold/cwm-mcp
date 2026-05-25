@@ -36,6 +36,51 @@ import (
 // ServiceType is the mDNS service the firmware queries for.
 const ServiceType = "_cwm-broker._tcp"
 
+// virtualIfacePrefixes mirrors the list in internal/mcp/server.go. We
+// must skip them on mDNS publication too: a device on the WiFi LAN can't
+// reach a Docker bridge / VPN tunnel address, but if we announce on that
+// interface zeroconf advertises every interface's IP — including the
+// unreachable ones — and the firmware's discovery code picks the first
+// match by device_id, which lands on the wrong IP.
+var virtualIfacePrefixes = []string{
+	"docker", "br-", "veth", "virbr", "vnet", "tun", "tap",
+	"vmnet", "tailscale", "wg", "zt",
+}
+
+func isVirtualIface(name string) bool {
+	for _, p := range virtualIfacePrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// physicalMulticastIfaces returns the multicast-capable, non-loopback,
+// non-virtual interfaces zeroconf should advertise on. Returning nil
+// would make zeroconf fall back to ALL multicast interfaces, which is
+// what we are explicitly trying to avoid.
+func physicalMulticastIfaces() []net.Interface {
+	all, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var out []net.Interface
+	for _, iface := range all {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if iface.Flags&net.FlagMulticast == 0 {
+			continue
+		}
+		if isVirtualIface(iface.Name) {
+			continue
+		}
+		out = append(out, iface)
+	}
+	return out
+}
+
 // Runtime is the value used in the TXT `runtime=` field. The Python and
 // JS impls publish the same record format with their own runtime tag so
 // a single TXT can disambiguate which binary won the bind race.
@@ -136,12 +181,18 @@ func Start(ctx context.Context, bind string, port int, lister devIDLister, logge
 	txt := buildTXT(devs)
 
 	instance := "cwm-broker-" + hostShort()
-	srv, err := zeroconf.Register(instance, ServiceType, "local.", port, txt, nil)
+	ifaces := physicalMulticastIfaces()
+	srv, err := zeroconf.Register(instance, ServiceType, "local.", port, txt, ifaces)
 	if err != nil {
 		return nil, fmt.Errorf("mdns register: %w", err)
 	}
 	if logger != nil {
-		logger.Printf("mdns: published %s.%s.local. port=%d devs=%d", instance, ServiceType, port, len(devs))
+		names := make([]string, 0, len(ifaces))
+		for _, i := range ifaces {
+			names = append(names, i.Name)
+		}
+		logger.Printf("mdns: published %s.%s.local. port=%d devs=%d ifaces=%v",
+			instance, ServiceType, port, len(devs), names)
 	}
 
 	p := &Publisher{server: srv, lastTxt: strings.Join(txt, ";")}
