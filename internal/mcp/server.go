@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -143,6 +144,9 @@ func NewServer(d Deps) *server.MCPServer {
 			mcp.WithString("theme_mode",
 				mcp.Description("Theme mode applied on the device: 'day' (light palette), 'night' (dark palette) or 'auto' (follows sunrise/sunset). The change takes effect on the reboot that follows promotion."),
 				mcp.Enum("day", "night", "auto"),
+			),
+			mcp.WithString("gemini_models",
+				mcp.Description("Comma-separated list of Gemini model IDs to show on the dashboard (max 3). Example: 'gemini-2.5-pro,gemini-2.5-flash'. Set to an empty string to clear the override and fall back to the broker's global default (service.toml [gemini].models)."),
 			),
 		),
 		handleSetDevicePending(d),
@@ -416,6 +420,25 @@ func handleProvisionHint(d Deps) server.ToolHandlerFunc {
 	}
 }
 
+// virtualIfacePrefixes are name prefixes for interfaces that the device on
+// the LAN can almost certainly NOT reach: container bridges, VM tunnels,
+// VPN endpoints. Including them in provision_hint led to devices being
+// configured with a Docker bridge IP (172.19.0.1) which the device's WiFi
+// can't route to.
+var virtualIfacePrefixes = []string{
+	"docker", "br-", "veth", "virbr", "vnet", "tun", "tap",
+	"vmnet", "tailscale", "wg", "zt",
+}
+
+func isVirtualIface(name string) bool {
+	for _, p := range virtualIfacePrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func localIPv4s() ([]string, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -424,6 +447,9 @@ func localIPv4s() ([]string, error) {
 	var out []string
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if isVirtualIface(iface.Name) {
 			continue
 		}
 		addrs, err := iface.Addrs()
