@@ -148,8 +148,29 @@ func NewServer(d Deps) *server.MCPServer {
 			mcp.WithString("gemini_models",
 				mcp.Description("Comma-separated list of Gemini model IDs to show on the dashboard (max 3). Example: 'gemini-2.5-pro,gemini-2.5-flash'. Set to an empty string to clear the override and fall back to the broker's global default (service.toml [gemini].models)."),
 			),
+			mcp.WithString("firmware_url",
+				mcp.Description("Direct HTTPS URL of the .bin to install. Either point at this broker's own /firmware/<file> (preferred for LAN dev) or any external HTTPS host (GitHub release, S3…). Must be set together with firmware_sha256 and firmware_version; otherwise the device ignores all three. Prefer wall_monitor_publish_firmware for the local-hosting flow."),
+			),
+			mcp.WithString("firmware_sha256",
+				mcp.Description("Lowercase hex SHA-256 (64 chars) of the .bin at firmware_url. The device computes the SHA from what actually landed in the inactive flash slot and refuses to set_boot_partition on mismatch."),
+			),
+			mcp.WithString("firmware_version",
+				mcp.Description("Version string baked into the .bin's esp_app_desc header (CONFIG_APP_PROJECT_VER in sdkconfig.defaults). The device refuses to install if the running image already matches this string, preventing reinstall loops."),
+			),
 		),
 		handleSetDevicePending(d),
+	)
+
+	s.AddTool(
+		mcp.NewTool("wall_monitor_publish_firmware",
+			mcp.WithDescription("Stage a firmware OTA for a registered device. Copies the .bin from bin_path into the broker's firmware directory (~/.config/claude-wall-monitor/firmware), computes the SHA-256, then queues a pending update with firmware_url pointing back at this broker's /firmware/<file> endpoint. The device picks up the change on its next /sync, downloads + verifies via the encrypted pending blob, switches the boot slot and reboots. If the new image's first broker poll fails, the bootloader auto-rolls back. Use external_url to point at an off-broker host (S3, GitHub Releases) instead of copying locally."),
+			mcp.WithString("device_id", mcp.Required(), mcp.Description("8 lowercase hex chars.")),
+			mcp.WithString("bin_path", mcp.Description("Absolute path to the freshly-built firmware .bin (e.g. firmware/build/cwm_wall_monitor.bin). Required when external_url is not set.")),
+			mcp.WithString("firmware_version", mcp.Required(), mcp.Description("Version string matching CWM_VERSION_STRING / CONFIG_APP_PROJECT_VER in the built image. Used as the destination filename (cwm-<version>.bin) and as the on-device dedupe key.")),
+			mcp.WithString("external_url", mcp.Description("Optional HTTPS URL to use instead of /firmware/<file>. When set, bin_path is ignored and the SHA must be supplied via sha256_hex.")),
+			mcp.WithString("sha256_hex", mcp.Description("Optional precomputed SHA-256. Required when external_url is set; ignored otherwise (we compute it from bin_path).")),
+		),
+		handlePublishFirmware(d),
 	)
 
 	registerDiscoveryTools(s, d)

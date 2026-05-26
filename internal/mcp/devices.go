@@ -2,15 +2,20 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/fractal-manifold/cwm-mcp/internal/config"
 	"github.com/fractal-manifold/cwm-mcp/internal/registry"
 )
 
@@ -91,6 +96,9 @@ func pendingChanges(active, pending registry.ConfigPayload) []string {
 	}
 	if pending.GeminiModels != nil && !stringSliceEqual(active.GeminiModels, pending.GeminiModels) {
 		diffs = append(diffs, "gemini_models")
+	}
+	if pending.FirmwareVersion != "" && pending.FirmwareVersion != active.FirmwareVersion {
+		diffs = append(diffs, "firmware: "+pending.FirmwareVersion)
 	}
 	return diffs
 }
@@ -310,6 +318,33 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 			update.GeminiModels = models
 		}
 
+		// Firmware fields ride the same pending blob. All-or-nothing on
+		// the device side, so reject partial specifications upfront with
+		// a clear message rather than silently dropping them.
+		fu := strings.TrimSpace(req.GetString("firmware_url", ""))
+		fs := strings.ToLower(strings.TrimSpace(req.GetString("firmware_sha256", "")))
+		fv := strings.TrimSpace(req.GetString("firmware_version", ""))
+		if fu != "" || fs != "" || fv != "" {
+			if fu == "" || fs == "" || fv == "" {
+				return mcp.NewToolResultError("firmware_url, firmware_sha256 and firmware_version must be supplied together"), nil
+			}
+			if !strings.HasPrefix(fu, "https://") {
+				return mcp.NewToolResultError("firmware_url must be HTTPS"), nil
+			}
+			if len(fs) != 64 {
+				return mcp.NewToolResultError("firmware_sha256 must be 64 lowercase hex chars"), nil
+			}
+			if _, err := hex.DecodeString(fs); err != nil {
+				return mcp.NewToolResultError("firmware_sha256 is not valid hex"), nil
+			}
+			if len(fv) > 31 {
+				return mcp.NewToolResultError("firmware_version must be ≤31 chars"), nil
+			}
+			update.FirmwareURL = fu
+			update.FirmwareSHA256 = fs
+			update.FirmwareVersion = fv
+		}
+
 		dev, err := d.Registry.SetPending(deviceID, update)
 		if err != nil {
 			if errors.Is(err, registry.ErrNotFound) {
@@ -353,4 +388,132 @@ func clamp8(v, lo, hi uint8) uint8 {
 		return hi
 	}
 	return v
+}
+
+// handlePublishFirmware copies a freshly-built .bin into the broker's
+// firmware directory, computes its SHA-256 and stages a pending update
+// pointing the device at it via /firmware/<file>. Two modes:
+//
+//  1. external_url: caller hosts the binary themselves (S3, GitHub
+//     Releases). bin_path is ignored, sha256_hex is required, URL is
+//     used verbatim.
+//  2. local hosting (default): bin_path is required and must exist;
+//     the file is copied to <firmware_dir>/cwm-<version>.bin, SHA is
+//     computed, and firmware_url is built from the device's active
+//     broker_url + /firmware/cwm-<version>.bin.
+//
+// Both paths end in registry.SetPending so the next /sync sees the
+// pending blob and the firmware/components/ota task on-device takes
+// over.
+func handlePublishFirmware(d Deps) server.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if d.Registry == nil {
+			return registryUnavailable(), nil
+		}
+		deviceID := strings.ToLower(strings.TrimSpace(req.GetString("device_id", "")))
+		if !registry.ValidDeviceID(deviceID) {
+			return mcp.NewToolResultError("device_id must be 8 lowercase hex chars"), nil
+		}
+		version := strings.TrimSpace(req.GetString("firmware_version", ""))
+		if version == "" {
+			return mcp.NewToolResultError("firmware_version is required"), nil
+		}
+		if len(version) > 31 {
+			return mcp.NewToolResultError("firmware_version must be ≤31 chars"), nil
+		}
+		if strings.ContainsAny(version, "/\\ \t") {
+			return mcp.NewToolResultError("firmware_version must not contain whitespace or path separators"), nil
+		}
+
+		dev, err := d.Registry.Load(deviceID)
+		if err != nil {
+			if errors.Is(err, registry.ErrNotFound) {
+				return mcp.NewToolResultError(fmt.Sprintf("device %s not registered — call wall_monitor_register_device first", deviceID)), nil
+			}
+			return mcp.NewToolResultErrorFromErr("load", err), nil
+		}
+
+		var firmwareURL, shaHex string
+		external := strings.TrimSpace(req.GetString("external_url", ""))
+
+		if external != "" {
+			if !strings.HasPrefix(external, "https://") {
+				return mcp.NewToolResultError("external_url must be HTTPS"), nil
+			}
+			shaHex = strings.ToLower(strings.TrimSpace(req.GetString("sha256_hex", "")))
+			if len(shaHex) != 64 {
+				return mcp.NewToolResultError("sha256_hex required (64 hex chars) when external_url is set"), nil
+			}
+			if _, err := hex.DecodeString(shaHex); err != nil {
+				return mcp.NewToolResultError("sha256_hex is not valid hex"), nil
+			}
+			firmwareURL = external
+		} else {
+			binPath := strings.TrimSpace(req.GetString("bin_path", ""))
+			if binPath == "" {
+				return mcp.NewToolResultError("bin_path required when external_url is not set"), nil
+			}
+			src, err := os.Open(binPath)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("cannot open bin_path: %v", err)), nil
+			}
+			defer src.Close()
+
+			firmwareDir := config.FirmwarePath()
+			if err := os.MkdirAll(firmwareDir, 0o755); err != nil {
+				return mcp.NewToolResultErrorFromErr("mkdir firmware dir", err), nil
+			}
+			fileName := "cwm-" + version + ".bin"
+			dstPath := filepath.Join(firmwareDir, fileName)
+			tmpPath := dstPath + ".tmp"
+			dst, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("open dst", err), nil
+			}
+			h := sha256.New()
+			mw := io.MultiWriter(dst, h)
+			if _, err := io.Copy(mw, src); err != nil {
+				dst.Close()
+				os.Remove(tmpPath)
+				return mcp.NewToolResultErrorFromErr("copy", err), nil
+			}
+			if err := dst.Sync(); err != nil {
+				dst.Close()
+				os.Remove(tmpPath)
+				return mcp.NewToolResultErrorFromErr("fsync", err), nil
+			}
+			if err := dst.Close(); err != nil {
+				os.Remove(tmpPath)
+				return mcp.NewToolResultErrorFromErr("close", err), nil
+			}
+			if err := os.Rename(tmpPath, dstPath); err != nil {
+				os.Remove(tmpPath)
+				return mcp.NewToolResultErrorFromErr("rename", err), nil
+			}
+			shaHex = hex.EncodeToString(h.Sum(nil))
+
+			base := strings.TrimRight(dev.Active.BrokerURL, "/")
+			if base == "" {
+				return mcp.NewToolResultError("device has no active broker_url; cannot build firmware_url. Re-register the device first."), nil
+			}
+			firmwareURL = base + "/firmware/" + fileName
+		}
+
+		update := registry.ConfigPayload{
+			FirmwareURL:     firmwareURL,
+			FirmwareSHA256:  shaHex,
+			FirmwareVersion: version,
+		}
+		dev2, err := d.Registry.SetPending(deviceID, update)
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("set_pending", err), nil
+		}
+		return mcp.NewToolResultJSON(struct {
+			OK             bool          `json:"ok"`
+			FirmwareURL    string        `json:"firmware_url"`
+			FirmwareSHA256 string        `json:"firmware_sha256"`
+			Version        string        `json:"firmware_version"`
+			Device         deviceSummary `json:"device"`
+		}{OK: true, FirmwareURL: firmwareURL, FirmwareSHA256: shaHex, Version: version, Device: summarise(dev2)})
+	}
 }

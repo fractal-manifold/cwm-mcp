@@ -10,14 +10,20 @@ package broker
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fractal-manifold/cwm-mcp/internal/auth"
@@ -127,10 +133,148 @@ func NewMux(cfg *config.Config, cache *auth.NonceCache, st *state.State, logger 
 			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
 		}
 	})
+	mux.HandleFunc("/firmware/", func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		handleFirmware(cfg, cache, logger, reg, rec, r)
+		if st != nil {
+			st.RecordRequest(r.RemoteAddr, rec.status, time.Now())
+		}
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 	})
 	return mux
+}
+
+// firmwareSHACache memoises SHA-256 hashes of artifacts in FirmwareDir
+// keyed by abs path + mtime + size. Computing SHA on every range request
+// would be wasteful (and noticeable for big .bin files), and the device
+// expects a stable ETag across resume attempts.
+type firmwareSHACacheEntry struct {
+	mtime time.Time
+	size  int64
+	hex   string
+}
+
+var (
+	firmwareSHACache   = map[string]firmwareSHACacheEntry{}
+	firmwareSHACacheMu sync.Mutex
+)
+
+func firmwareSHA(path string, fi os.FileInfo) (string, error) {
+	firmwareSHACacheMu.Lock()
+	if e, ok := firmwareSHACache[path]; ok && e.mtime.Equal(fi.ModTime()) && e.size == fi.Size() {
+		firmwareSHACacheMu.Unlock()
+		return e.hex, nil
+	}
+	firmwareSHACacheMu.Unlock()
+
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	sum := hex.EncodeToString(h.Sum(nil))
+	firmwareSHACacheMu.Lock()
+	firmwareSHACache[path] = firmwareSHACacheEntry{mtime: fi.ModTime(), size: fi.Size(), hex: sum}
+	firmwareSHACacheMu.Unlock()
+	return sum, nil
+}
+
+// handleFirmware serves binaries from config.FirmwarePath() to devices
+// that have been armed with an OTA update. Authenticates with the same
+// HMAC-v2 scheme as /credentials, accepting either the device's active
+// or pending PSK (so a freshly-rotated device can still pull). Supports
+// Range: requests via http.ServeContent so resume-on-reconnect works.
+//
+// Path traversal is the obvious risk; filepath.Clean and the dir-prefix
+// check below close it. Unknown device IDs cannot be derived from the
+// request (the URL only carries the file name), so we fall back to the
+// global PSK in cfg — same fallback /credentials uses for legacy mode.
+func handleFirmware(cfg *config.Config, cache *auth.NonceCache, logger *log.Logger, reg *registry.Registry, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	name := strings.TrimPrefix(r.URL.Path, "/firmware/")
+	if name == "" || strings.ContainsAny(name, "/\\") {
+		writeError(w, http.StatusBadRequest, "invalid filename")
+		return
+	}
+
+	baseDir := config.FirmwarePath()
+	full := filepath.Join(baseDir, name)
+	cleanBase, _ := filepath.Abs(baseDir)
+	cleanFull, _ := filepath.Abs(full)
+	if !strings.HasPrefix(cleanFull, cleanBase+string(os.PathSeparator)) && cleanFull != cleanBase {
+		writeError(w, http.StatusBadRequest, "invalid path")
+		return
+	}
+
+	// Auth: same canonical v2 as everything else. We accept either the
+	// global PSK or any registered device's active/pending PSK so the
+	// HMAC layer doesn't have to know which device asked.
+	signedPath := r.URL.Path
+	psks := [][]byte{cfg.PSK()}
+	if reg != nil {
+		// Look up by X-Cwm-Device when present — cheaper than scanning
+		// the whole registry on every request, which a chunked Range
+		// download can hit many times in a row.
+		if devID := r.Header.Get("X-Cwm-Device"); registry.ValidDeviceID(devID) {
+			if a, p, err := reg.PSKsFor(devID); err == nil {
+				if len(a) == 32 {
+					psks = append(psks, a)
+				}
+				if len(p) == 32 {
+					psks = append(psks, p)
+				}
+			}
+		}
+	}
+	if _, verr := auth.VerifyMulti(
+		psks,
+		"GET", signedPath,
+		r.Header.Get("X-Cwm-Timestamp"),
+		r.Header.Get("X-Cwm-Nonce"),
+		r.Header.Get("X-Cwm-Signature"),
+		r.Header.Get("X-Cwm-Device"),
+		r.Header.Get("X-Cwm-Config-Version"),
+		cache,
+		time.Duration(cfg.Security.MaxTimestampSkewSeconds)*time.Second,
+		time.Now(),
+	); verr != nil {
+		logger.Printf("auth rejected /firmware/%s from %s: %v", name, r.RemoteAddr, verr)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	f, err := os.Open(full)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "firmware not found")
+			return
+		}
+		logger.Printf("open %s: %v", full, err)
+		writeError(w, http.StatusInternalServerError, "io error")
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "stat failed")
+		return
+	}
+	if sum, err := firmwareSHA(full, fi); err == nil {
+		w.Header().Set("ETag", `"`+sum+`"`)
+		w.Header().Set("X-Cwm-Firmware-SHA256", sum)
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeContent(w, r, name, fi.ModTime(), f)
 }
 
 func handleFirmwareLogs(cfg *config.Config, cache *auth.NonceCache, logger *log.Logger, fwLogs FirmwareLogSource, w http.ResponseWriter, r *http.Request) {
@@ -537,6 +681,15 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 		// device makes the override observable in Settings and survive
 		// broker restarts before the next sync.
 		wire["gemini_models"] = strings.Join(p.GeminiModels, ",")
+	}
+	// OTA staging fields. firmware/components/net/src/config_sync.c
+	// requires ALL THREE to be present and well-formed before arming
+	// the on-device cwm_ota_* NVS keys, so we send them together or
+	// not at all. The SHA-256 is the integrity anchor for the .bin.
+	if p.FirmwareURL != "" && p.FirmwareSHA256 != "" && p.FirmwareVersion != "" {
+		wire["firmware_url"] = p.FirmwareURL
+		wire["firmware_sha256"] = p.FirmwareSHA256
+		wire["firmware_version"] = p.FirmwareVersion
 	}
 	return json.Marshal(wire)
 }

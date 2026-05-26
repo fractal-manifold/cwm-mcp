@@ -72,6 +72,18 @@ type ConfigPayload struct {
 	// for the device. Empty means "use the global default". Max 3 entries;
 	// excess is silently clamped on the broker side.
 	GeminiModels         []string     `toml:"gemini_models,omitempty"`
+	// FirmwareURL / FirmwareSHA256 / FirmwareVersion carry a staged OTA
+	// update through the same pending envelope as a config change. All
+	// three must be present in the pending payload for the firmware's
+	// config_sync to arm the on-device cwm_ota_* NVS keys (see
+	// firmware/components/ota/src/cwm_ota.c). The URL must be HTTPS so
+	// the device's CA bundle applies; the SHA-256 is the integrity
+	// anchor since the .bin itself is not signed; the version string
+	// must match the esp_app_desc baked into the binary so the device
+	// can refuse to re-install or downgrade.
+	FirmwareURL          string       `toml:"firmware_url,omitempty"`
+	FirmwareSHA256       string       `toml:"firmware_sha256,omitempty"`
+	FirmwareVersion      string       `toml:"firmware_version,omitempty"`
 }
 
 type Active struct {
@@ -514,6 +526,15 @@ func mergePayload(base, upd ConfigPayload) ConfigPayload {
 		copy(m, upd.GeminiModels)
 		out.GeminiModels = m
 	}
+	if upd.FirmwareURL != "" {
+		out.FirmwareURL = upd.FirmwareURL
+	}
+	if upd.FirmwareSHA256 != "" {
+		out.FirmwareSHA256 = upd.FirmwareSHA256
+	}
+	if upd.FirmwareVersion != "" {
+		out.FirmwareVersion = upd.FirmwareVersion
+	}
 	return out
 }
 
@@ -521,7 +542,10 @@ func payloadEquivalent(a, b ConfigPayload) bool {
 	if a.BrokerURL != b.BrokerURL ||
 		a.PSKHex != b.PSKHex ||
 		a.City != b.City ||
-		a.ThemeMode != b.ThemeMode {
+		a.ThemeMode != b.ThemeMode ||
+		a.FirmwareURL != b.FirmwareURL ||
+		a.FirmwareSHA256 != b.FirmwareSHA256 ||
+		a.FirmwareVersion != b.FirmwareVersion {
 		return false
 	}
 	if !ptrU8Equal(a.BrDay, b.BrDay) {

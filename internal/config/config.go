@@ -22,11 +22,19 @@ const (
 	DefaultPath = "~/.config/claude-wall-monitor/cwm.toml"
 	LegacyPath  = "~/.config/claude-wall-monitor/service.toml"
 	DevicesDir  = "~/.config/claude-wall-monitor/devices"
+	// FirmwareDir holds binaries served by GET /firmware/<name>. The
+	// publish_firmware MCP tool copies the .bin here and the device
+	// downloads from there after a pending OTA promotion.
+	FirmwareDir = "~/.config/claude-wall-monitor/firmware"
 )
 
 // DevicesPath returns the absolute path to the per-device registry
 // directory. Exposed so main() can hand it to registry.New.
 func DevicesPath() string { return expandUser(DevicesDir) }
+
+// FirmwarePath returns the absolute path to the firmware artifact
+// directory. Exposed so main() can hand it to broker.NewMux.
+func FirmwarePath() string { return expandUser(FirmwareDir) }
 
 type Config struct {
 	Server      Server      `toml:"server"`
