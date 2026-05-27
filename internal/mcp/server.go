@@ -157,8 +157,28 @@ func NewServer(d Deps) *server.MCPServer {
 			mcp.WithString("firmware_version",
 				mcp.Description("Version string baked into the .bin's esp_app_desc header (CONFIG_APP_PROJECT_VER in sdkconfig.defaults). The device refuses to install if the running image already matches this string, preventing reinstall loops."),
 			),
+			mcp.WithString("firmware_manifest_b64",
+				mcp.Description("Base64 of the canonical-JSON Ed25519 manifest produced by `firmware/components/ota/scripts/manifest.py sign`. The device verifies sig(manifest) BEFORE downloading the .bin and refuses unsigned manifests unless built with CWM_OTA_UNSIGNED=y. Must be supplied together with firmware_manifest_sig_b64."),
+			),
+			mcp.WithString("firmware_manifest_sig_b64",
+				mcp.Description("Base64 of the 64-byte Ed25519 signature over the manifest bytes (the `signature_b64` field from `manifest.py sign`'s output). Must be supplied together with firmware_manifest_b64."),
+			),
 		),
 		handleSetDevicePending(d),
+	)
+
+	s.AddTool(
+		mcp.NewTool("wall_monitor_revert_firmware",
+			mcp.WithDescription("Stage a rollback to a previously-shipped firmware version. The broker enforces anti-rollback: if the target's min_secure_version is below the device's current floor, the call is rejected upfront with a message explaining the constraint. Required because the device will reject the install anyway, and the operator should learn this synchronously rather than after a wasted /sync round."),
+			mcp.WithString("device_id", mcp.Required(), mcp.Description("8 lowercase hex chars.")),
+			mcp.WithString("firmware_url", mcp.Required(), mcp.Description("HTTPS URL of the target .bin.")),
+			mcp.WithString("firmware_sha256", mcp.Required(), mcp.Description("64 lowercase hex chars.")),
+			mcp.WithString("firmware_version", mcp.Required(), mcp.Description("semver MAJOR.MINOR.PATCH of the target.")),
+			mcp.WithString("firmware_manifest_b64", mcp.Required(), mcp.Description("Canonical manifest base64.")),
+			mcp.WithString("firmware_manifest_sig_b64", mcp.Required(), mcp.Description("Ed25519 sig base64.")),
+			mcp.WithNumber("target_min_secure_version", mcp.Description("Packed 8.8.16 semver. When supplied, the broker compares it to the device's cwm_min_sv mirror and rejects the call if the target is below it. Omit to skip the broker-side gate (the device will still enforce its own gate against the manifest's min_secure_version).")),
+		),
+		handleRevertFirmware(d),
 	)
 
 	s.AddTool(

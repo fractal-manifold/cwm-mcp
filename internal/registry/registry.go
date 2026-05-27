@@ -34,7 +34,15 @@ import (
 // SchemaVersion identifies the on-disk TOML layout. Bump when fields move
 // or get renamed so callers can refuse incompatible files instead of
 // silently producing junk.
-const SchemaVersion = 1
+//
+// v2 adds: device.serial_number, device.hw_sku (factory identity),
+//          pending.firmware_manifest_b64 / firmware_manifest_sig_b64
+//          (signed OTA manifest delivered alongside the .bin URL),
+//          active.min_secure_version (anti-rollback floor mirrored
+//          from the device's cwm_min_sv NVS key).
+// v1 files load with empty serial / hw_sku / manifest fields and are
+// re-serialised as v2 on the next save (migration in loadLocked).
+const SchemaVersion = 2
 
 // ProviderSet mirrors the firmware's per-provider NVS toggles (NVS keys
 // prov_claude, prov_codex, prov_gemini). Stored as plain bools so an
@@ -84,6 +92,23 @@ type ConfigPayload struct {
 	FirmwareURL          string       `toml:"firmware_url,omitempty"`
 	FirmwareSHA256       string       `toml:"firmware_sha256,omitempty"`
 	FirmwareVersion      string       `toml:"firmware_version,omitempty"`
+	// FirmwareManifestB64 is the base64 of the canonical-JSON Ed25519
+	// manifest produced by `firmware/components/ota/scripts/manifest.py
+	// sign`. FirmwareManifestSigB64 is the base64 of the 64-byte raw
+	// signature over those exact bytes. Both fields travel inside the
+	// AES-CTR-encrypted pending blob; the firmware verifies the
+	// signature with one of the pubkeys in cwm_ota_pubkey_{current,next}
+	// BEFORE downloading the .bin. See firmware/components/ota/include/
+	// cwm_manifest.h for the canonical key order.
+	FirmwareManifestB64    string `toml:"firmware_manifest_b64,omitempty"`
+	FirmwareManifestSigB64 string `toml:"firmware_manifest_sig_b64,omitempty"`
+	// MinSecureVersion mirrors the device's cwm_min_sv NVS key (packed
+	// 8.8.16 = major.minor.patch). Pending payloads must satisfy
+	// manifest.min_secure_version >= active.MinSecureVersion or the
+	// firmware refuses to apply. Tracked here so revert-via-MCP can
+	// surface "this rollback would violate anti-rollback" before it
+	// touches the device.
+	MinSecureVersion       uint32 `toml:"min_secure_version,omitempty"`
 }
 
 type Active struct {
@@ -98,10 +123,23 @@ type Pending struct {
 
 // Device is the full per-device record.
 type Device struct {
-	SchemaVersion int      `toml:"schema_version"`
-	DeviceID      string   `toml:"device_id"`
-	Active        Active   `toml:"active"`
-	Pending       *Pending `toml:"pending,omitempty"`
+	SchemaVersion int    `toml:"schema_version"`
+	DeviceID      string `toml:"device_id"`
+	// SerialNumber is the human-readable factory serial baked in the
+	// device's eFuse BLOCK_USR_DATA (or the NVS dev override). Format:
+	// "CWM-<SKU2>-<FAC3>-<YYWW4>-<SEQ6>-<C1>" — 24 chars. Empty on
+	// devices that haven't yet sent the X-Cwm-Serial header (legacy /
+	// pre-rev-2 firmware). Persisted but never authoritative — we
+	// always trust the device's eFuse over what the broker remembers.
+	SerialNumber string `toml:"serial_number,omitempty"`
+	// HWSku is the 2-char SKU code parsed out of SerialNumber (or "DEV"
+	// for non-factory units). Stored separately so MCP queries don't
+	// have to re-parse the serial. The broker NEVER promotes a pending
+	// whose firmware_manifest_b64.sku conflicts with this — the
+	// firmware would reject it anyway, this just spares the round trip.
+	HWSku   string   `toml:"hw_sku,omitempty"`
+	Active  Active   `toml:"active"`
+	Pending *Pending `toml:"pending,omitempty"`
 }
 
 // Registry owns the on-disk store under devicesDir. Construct via New.
@@ -170,7 +208,14 @@ func (r *Registry) loadLocked(dataPath string) (*Device, error) {
 	if err := toml.Unmarshal(raw, &dev); err != nil {
 		return nil, fmt.Errorf("registry: parse %s: %w", dataPath, err)
 	}
-	if dev.SchemaVersion != 0 && dev.SchemaVersion != SchemaVersion {
+	switch dev.SchemaVersion {
+	case 0, 1, SchemaVersion:
+		// v0 = freshly-decoded zero value (no field set). v1 is the
+		// pre-serial schema — migrated transparently: serial_number /
+		// hw_sku stay empty until the next /sync round populates them
+		// from the X-Cwm-Serial header, and the next save bumps the
+		// stored schema_version to SchemaVersion.
+	default:
 		return nil, fmt.Errorf("registry: %s schema %d, expected %d", dataPath, dev.SchemaVersion, SchemaVersion)
 	}
 	return &dev, nil
@@ -391,6 +436,65 @@ func (r *Registry) Touch(deviceID string) error {
 	})
 }
 
+// SetSerial persists the X-Cwm-Serial / X-Cwm-Sku headers reported by
+// the device on /sync. Non-destructive: if either string is empty the
+// existing value is kept (a v2 broker can rendezvous with a v1
+// firmware that doesn't send the header without losing the serial it
+// already knew). Returns silently for unknown devices — the headers
+// arrived together with an authenticated request, so unknown-device
+// means a race with a fresh registration, not a header forgery.
+func (r *Registry) SetSerial(deviceID, serial, sku string) error {
+	if !ValidDeviceID(deviceID) {
+		return fmt.Errorf("registry: invalid device_id %q", deviceID)
+	}
+	return r.withLock(deviceID, func(p string) error {
+		dev, err := r.loadLocked(p)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil
+			}
+			return err
+		}
+		changed := false
+		if serial != "" && serial != dev.SerialNumber {
+			dev.SerialNumber = serial
+			changed = true
+		}
+		if sku != "" && sku != dev.HWSku {
+			dev.HWSku = sku
+			changed = true
+		}
+		if !changed {
+			return nil
+		}
+		return r.saveLocked(dev, p)
+	})
+}
+
+// BumpMinSV records that the device acknowledged installing a firmware
+// with at least `sv` packed semver. Monotonic — never lowers the
+// floor. Used by revert-via-MCP to reject downgrade pendings before
+// they reach the device.
+func (r *Registry) BumpMinSV(deviceID string, sv uint32) error {
+	if !ValidDeviceID(deviceID) {
+		return fmt.Errorf("registry: invalid device_id %q", deviceID)
+	}
+	return r.withLock(deviceID, func(p string) error {
+		dev, err := r.loadLocked(p)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil
+			}
+			return err
+		}
+		if sv <= dev.Active.MinSecureVersion {
+			return nil
+		}
+		dev.Active.MinSecureVersion = sv
+		return r.saveLocked(dev, p)
+	})
+}
+
 // PSKsFor returns the active PSK and, when a pending config carries a
 // PSK change, the pending PSK too. Either may be nil if the
 // corresponding hex is unset (pending often has no PSK change). The
@@ -535,6 +639,25 @@ func mergePayload(base, upd ConfigPayload) ConfigPayload {
 	if upd.FirmwareVersion != "" {
 		out.FirmwareVersion = upd.FirmwareVersion
 	}
+	// Manifest pair and anti-rollback floor — same partial-update rule
+	// as the rest: a missing field means "no opinion", an empty
+	// explicit override falls back to the default zero value. We
+	// merge both b64 fields independently rather than treating them
+	// as a unit so a follow-up rotation can drop the sig in isolation
+	// while keeping the manifest text for audit. The device's
+	// `gate_manifest` is what enforces the pair-or-fail rule.
+	if upd.FirmwareManifestB64 != "" {
+		out.FirmwareManifestB64 = upd.FirmwareManifestB64
+	}
+	if upd.FirmwareManifestSigB64 != "" {
+		out.FirmwareManifestSigB64 = upd.FirmwareManifestSigB64
+	}
+	// Anti-rollback is monotonic: a merge can only raise the floor,
+	// never lower it. This matches the firmware-side invariant on
+	// cwm_min_sv (refuses any decrease).
+	if upd.MinSecureVersion > out.MinSecureVersion {
+		out.MinSecureVersion = upd.MinSecureVersion
+	}
 	return out
 }
 
@@ -545,7 +668,10 @@ func payloadEquivalent(a, b ConfigPayload) bool {
 		a.ThemeMode != b.ThemeMode ||
 		a.FirmwareURL != b.FirmwareURL ||
 		a.FirmwareSHA256 != b.FirmwareSHA256 ||
-		a.FirmwareVersion != b.FirmwareVersion {
+		a.FirmwareVersion != b.FirmwareVersion ||
+		a.FirmwareManifestB64 != b.FirmwareManifestB64 ||
+		a.FirmwareManifestSigB64 != b.FirmwareManifestSigB64 ||
+		a.MinSecureVersion != b.MinSecureVersion {
 		return false
 	}
 	if !ptrU8Equal(a.BrDay, b.BrDay) {

@@ -691,6 +691,19 @@ func pendingPayloadJSON(p registry.ConfigPayload) ([]byte, error) {
 		wire["firmware_sha256"] = p.FirmwareSHA256
 		wire["firmware_version"] = p.FirmwareVersion
 	}
+	// Signed manifest delivery (schema v2). The firmware verifies the
+	// Ed25519 signature over the canonical manifest BEFORE downloading
+	// the .bin, so missing either field on a firmware-bearing pending
+	// turns the OTA into a no-op (production firmware refuses unsigned
+	// manifests unless built with CWM_OTA_UNSIGNED=y). We forward
+	// whichever fields are present and let the device-side gate apply
+	// the policy.
+	if p.FirmwareManifestB64 != "" {
+		wire["firmware_manifest_b64"] = p.FirmwareManifestB64
+	}
+	if p.FirmwareManifestSigB64 != "" {
+		wire["firmware_manifest_sig_b64"] = p.FirmwareManifestSigB64
+	}
 	return json.Marshal(wire)
 }
 
@@ -762,6 +775,27 @@ func handleDeviceSync(cfg *config.Config, cache *auth.NonceCache, logger *log.Lo
 	}
 	if terr := reg.Touch(deviceID); terr != nil {
 		logger.Printf("registry touch %s: %v", deviceID, terr)
+	}
+	// Schema v2: capture the device's reported factory serial + SKU
+	// when present. These headers are NOT bound to the HMAC (see
+	// CLAUDE.md "Things NOT to assume" — the X-Cwm-Sku is metadata of
+	// routing, not a security control). The Ed25519 manifest on a
+	// pending firmware is what actually enforces SKU at install time.
+	if serial := r.Header.Get("X-Cwm-Serial"); serial != "" {
+		sku := r.Header.Get("X-Cwm-Sku")
+		if serr := reg.SetSerial(deviceID, serial, sku); serr != nil {
+			logger.Printf("registry set-serial %s: %v", deviceID, serr)
+		}
+	}
+	// Mirror the device's anti-rollback floor. BumpMinSV is monotonic
+	// in the registry; a spoofed-high value can only lock the device
+	// out of downgrade attacks, not enable one.
+	if msv := r.Header.Get("X-Cwm-Min-Sv"); msv != "" {
+		if sv, err := strconv.ParseUint(msv, 10, 32); err == nil {
+			if berr := reg.BumpMinSV(deviceID, uint32(sv)); berr != nil {
+				logger.Printf("registry bump-min-sv %s: %v", deviceID, berr)
+			}
+		}
 	}
 
 	dev, lerr := reg.Load(deviceID)

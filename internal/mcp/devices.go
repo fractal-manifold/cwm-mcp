@@ -24,10 +24,13 @@ import (
 // rotation is queued without learning the keys themselves.
 type deviceSummary struct {
 	DeviceID         string    `json:"device_id"`
+	SerialNumber     string    `json:"serial_number,omitempty"`
+	HWSku            string    `json:"hw_sku,omitempty"`
 	ActiveVersion    uint32    `json:"active_version"`
 	ActiveBrokerURL  string    `json:"active_broker_url,omitempty"`
 	ActiveCity       string    `json:"active_city,omitempty"`
 	ActiveProviders  []string  `json:"active_providers,omitempty"`
+	MinSecureVersion uint32    `json:"min_secure_version,omitempty"`
 	LastSeen         time.Time `json:"last_seen,omitempty"`
 	HasPending       bool      `json:"has_pending"`
 	PendingVersion   uint32    `json:"pending_version,omitempty"`
@@ -117,12 +120,15 @@ func stringSliceEqual(a, b []string) bool {
 
 func summarise(dev *registry.Device) deviceSummary {
 	s := deviceSummary{
-		DeviceID:        dev.DeviceID,
-		ActiveVersion:   dev.Active.Version,
-		ActiveBrokerURL: dev.Active.BrokerURL,
-		ActiveCity:      dev.Active.City,
-		ActiveProviders: providerNames(dev.Active.Providers),
-		LastSeen:        dev.Active.LastSeen,
+		DeviceID:         dev.DeviceID,
+		SerialNumber:     dev.SerialNumber,
+		HWSku:            dev.HWSku,
+		ActiveVersion:    dev.Active.Version,
+		ActiveBrokerURL:  dev.Active.BrokerURL,
+		ActiveCity:       dev.Active.City,
+		ActiveProviders:  providerNames(dev.Active.Providers),
+		MinSecureVersion: dev.Active.MinSecureVersion,
+		LastSeen:         dev.Active.LastSeen,
 	}
 	if dev.Pending != nil {
 		s.HasPending = true
@@ -345,6 +351,30 @@ func handleSetDevicePending(d Deps) server.ToolHandlerFunc {
 			update.FirmwareVersion = fv
 		}
 
+		// Schema v2: signed manifest envelope. Optional in this call so
+		// CI can stage unsigned firmware against dev units, but a
+		// production device built without CWM_OTA_UNSIGNED will refuse
+		// to install an OTA whose pending lacks these fields. We do
+		// NOT parse the manifest here for sku/min_sv (the operator may
+		// be staging a manifest the broker doesn't have a pubkey for);
+		// the device-side gate is authoritative.
+		if mb := strings.TrimSpace(req.GetString("firmware_manifest_b64", "")); mb != "" {
+			if len(mb) > 4096 {
+				return mcp.NewToolResultError("firmware_manifest_b64 exceeds 4 KiB"), nil
+			}
+			update.FirmwareManifestB64 = mb
+		}
+		if sb := strings.TrimSpace(req.GetString("firmware_manifest_sig_b64", "")); sb != "" {
+			if len(sb) > 128 {
+				return mcp.NewToolResultError("firmware_manifest_sig_b64 looks wrong (Ed25519 sig is 64 B → ~88 base64 chars)"), nil
+			}
+			update.FirmwareManifestSigB64 = sb
+		}
+		// Pair check: if either manifest field is present, BOTH must be.
+		if (update.FirmwareManifestB64 == "") != (update.FirmwareManifestSigB64 == "") {
+			return mcp.NewToolResultError("firmware_manifest_b64 and firmware_manifest_sig_b64 must be supplied together"), nil
+		}
+
 		dev, err := d.Registry.SetPending(deviceID, update)
 		if err != nil {
 			if errors.Is(err, registry.ErrNotFound) {
@@ -388,6 +418,79 @@ func clamp8(v, lo, hi uint8) uint8 {
 		return hi
 	}
 	return v
+}
+
+// handleRevertFirmware stages a pending whose firmware fields point at
+// a previous version. Anti-rollback: the broker rejects the call
+// upfront if the target's min_secure_version is below the device's
+// active min_secure_version (the device would refuse anyway, this
+// just spares a round trip and surfaces the constraint to the
+// operator).
+//
+// The operator supplies the target's firmware_url / firmware_sha256 /
+// firmware_version + the signed manifest blobs. The broker doesn't
+// keep history of past manifests yet (planned: service.toml
+// [ota.history]); for now the operator pastes them in.
+func handleRevertFirmware(d Deps) server.ToolHandlerFunc {
+	return func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if d.Registry == nil {
+			return registryUnavailable(), nil
+		}
+		deviceID := strings.ToLower(strings.TrimSpace(req.GetString("device_id", "")))
+		if !registry.ValidDeviceID(deviceID) {
+			return mcp.NewToolResultError("device_id must be 8 lowercase hex chars"), nil
+		}
+		fu := strings.TrimSpace(req.GetString("firmware_url", ""))
+		fs := strings.ToLower(strings.TrimSpace(req.GetString("firmware_sha256", "")))
+		fv := strings.TrimSpace(req.GetString("firmware_version", ""))
+		mb := strings.TrimSpace(req.GetString("firmware_manifest_b64", ""))
+		sb := strings.TrimSpace(req.GetString("firmware_manifest_sig_b64", ""))
+		targetSV := uint32(req.GetFloat("target_min_secure_version", 0))
+
+		if fu == "" || fs == "" || fv == "" || mb == "" || sb == "" {
+			return mcp.NewToolResultError("revert requires firmware_url, firmware_sha256, firmware_version, firmware_manifest_b64 and firmware_manifest_sig_b64"), nil
+		}
+		if !strings.HasPrefix(fu, "https://") {
+			return mcp.NewToolResultError("firmware_url must be HTTPS"), nil
+		}
+		if len(fs) != 64 {
+			return mcp.NewToolResultError("firmware_sha256 must be 64 lowercase hex chars"), nil
+		}
+		if _, err := hex.DecodeString(fs); err != nil {
+			return mcp.NewToolResultError("firmware_sha256 is not valid hex"), nil
+		}
+
+		dev, err := d.Registry.Load(deviceID)
+		if err != nil {
+			if errors.Is(err, registry.ErrNotFound) {
+				return mcp.NewToolResultError(fmt.Sprintf("device %s not registered", deviceID)), nil
+			}
+			return mcp.NewToolResultErrorFromErr("load", err), nil
+		}
+		if targetSV > 0 && targetSV < dev.Active.MinSecureVersion {
+			return mcp.NewToolResultError(fmt.Sprintf(
+				"revert blocked by anti-rollback: target min_secure_version=%d < device floor=%d. "+
+					"To downgrade, issue a new firmware with min_secure_version below %d, signed by the KSK.",
+				targetSV, dev.Active.MinSecureVersion, dev.Active.MinSecureVersion)), nil
+		}
+
+		update := registry.ConfigPayload{
+			FirmwareURL:            fu,
+			FirmwareSHA256:         fs,
+			FirmwareVersion:        fv,
+			FirmwareManifestB64:    mb,
+			FirmwareManifestSigB64: sb,
+		}
+		dev2, err := d.Registry.SetPending(deviceID, update)
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("set_pending", err), nil
+		}
+		return mcp.NewToolResultJSON(struct {
+			OK      bool          `json:"ok"`
+			Reverts string        `json:"reverts_to"`
+			Device  deviceSummary `json:"device"`
+		}{OK: true, Reverts: fv, Device: summarise(dev2)})
+	}
 }
 
 // handlePublishFirmware copies a freshly-built .bin into the broker's
